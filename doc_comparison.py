@@ -84,7 +84,7 @@ class DeviationItem(BaseModel):
     All fields are validated by Pydantic — deviation is always bool.
     """
     item_no: int = Field(description="Sequential deviation number, starting at 1.")
-    section: str = Field(description="Section name inferred from the base document context.")
+    section: str = Field(description="Short overarching category label inferred from the subject matter of the compared clauses (e.g. 'Interest Rate', 'Security', 'Repayment'). Must be concise (2–4 words), not a verbatim heading from either document.")
     base_page: int = Field(description="Page number in the base PDF where the clause appears.")
     compare_page: int = Field(description="Page number in the offer document where the clause appears.")
     base_paragraph: str = Field(description="The relevant clause text from the base document.")
@@ -258,8 +258,9 @@ deviation.
 offer, that is a deviation. Set compare_page to 0 and note the omission.
 5. If a clause exists in the offer but NOT in the base document, that is \
 also a deviation. Set base_page to 0 and note the addition.
-6. Return ONLY the items where deviation=True.
+6. Return ALL clauses examined, including those where deviation=False.
 7. Populate every field accurately, especially page numbers.
+8. The "section" field must be a SHORT category label (2–4 words) describing the subject matter of the deviation — e.g. "Interest Rate", "DSCR Covenant", "Security", "Repayment Terms". Never copy clause text into this field.
 
 Respond strictly with a JSON object matching this schema — no markdown \
 fences, no commentary outside the JSON:
@@ -268,7 +269,7 @@ fences, no commentary outside the JSON:
   "deviations": [
     {
       "item_no": <int>,
-      "section": "<string>",
+      "section": "<short category label, 2-4 words, inferred from the subject matter — e.g. 'Interest Rate', 'Security', 'Repayment'>",
       "base_page": <int>,
       "compare_page": <int>,
       "base_paragraph": "<string>",
@@ -347,6 +348,47 @@ def run_comparison_openai(
     )
 
 
+def _fix_section_labels(deviations: list[DeviationItem], llm: ChatOllama) -> list[DeviationItem]:
+    """
+    Post-processing pass: if any section label looks like copied clause text
+    (> 50 chars), ask the model to re-label all deviations in one shot.
+    """
+    if all(len(d.section) <= 50 for d in deviations):
+        return deviations
+
+    items = "\n".join(
+        f"{d.item_no}. base: {d.base_paragraph[:120]} | compare: {d.compare_paragraph[:120]}"
+        for d in deviations
+    )
+    prompt = (
+        "For each numbered deviation below, respond with ONLY a JSON array of short "
+        "category labels (2–4 words each), in the same order. "
+        "Examples: [\"Interest Rate\", \"DSCR Covenant\", \"Security\"]\n\n"
+        + items
+    )
+    raw = llm.invoke([("human", prompt)]).content.strip()
+
+    # Extract the JSON array from the response
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return deviations
+    try:
+        labels: list[str] = json.loads(match.group())
+    except json.JSONDecodeError:
+        return deviations
+
+    # Flatten in case the model returns nested lists e.g. [["Interest Rate"], ...]
+    flat: list[str] = []
+    for item in labels:
+        flat.append(item[0] if isinstance(item, list) else item)
+
+    fixed = []
+    for i, d in enumerate(deviations):
+        label = str(flat[i]).strip() if i < len(flat) else d.section
+        fixed.append(d.model_copy(update={"section": label}))
+    return fixed
+
+
 def run_comparison_ollama(
     model: str,
     base_doc: PagedDocument,
@@ -365,6 +407,9 @@ def run_comparison_ollama(
         ("system", SYSTEM_PROMPT),
         ("human",  user_prompt),
     ])
+
+    fixed_deviations = _fix_section_labels(result.deviations, llm)
+    result = ComparisonResult(deviations=fixed_deviations)
 
     return ComparisonReport(
         base_doc=base_doc.doc_name,
