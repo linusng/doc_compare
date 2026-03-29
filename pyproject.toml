@@ -1,0 +1,14 @@
+[project]
+name = "doc-compare"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain-core>=1.2.23",
+    "langchain-ollama>=1.0.1",
+    "openai>=2.30.0",
+    "pydantic>=2.12.5",
+    "pymupdf>=1.27.2.2",
+    "python-docx>=1.2.0",
+    "tiktoken>=0.12.0",
+]
