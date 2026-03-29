@@ -39,6 +39,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import anthropic
 import fitz  # PyMuPDF
 import tiktoken
 from docx import Document as DocxDocument
@@ -400,7 +401,7 @@ def run_comparison_ollama(
     user_prompt = build_user_prompt(base_doc, compare_doc)
     _token_guard(SYSTEM_PROMPT + "\n\n" + user_prompt, model, context_limit)
 
-    llm = ChatOllama(model=model, temperature=0, base_url=base_url)
+    llm = ChatOllama(model=model, temperature=0, base_url=base_url, num_ctx=context_limit)
     structured_llm = llm.with_structured_output(ComparisonResult)
 
     result: ComparisonResult = structured_llm.invoke([
@@ -415,6 +416,47 @@ def run_comparison_ollama(
         base_doc=base_doc.doc_name,
         compare_doc=compare_doc.doc_name,
         total_tokens_used=0,   # Ollama does not expose token usage via LangChain
+        result=result,
+    )
+
+
+def run_comparison_anthropic(
+    model: str,
+    base_doc: PagedDocument,
+    compare_doc: PagedDocument,
+    context_limit: int,
+    api_key: Optional[str] = None,
+) -> ComparisonReport:
+    """Anthropic Claude path — uses client.messages.parse() for native Pydantic structured output."""
+    user_prompt = build_user_prompt(base_doc, compare_doc)
+    _token_guard(SYSTEM_PROMPT + "\n\n" + user_prompt, model, context_limit)
+
+    client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY", ""))
+
+    with client.messages.stream(
+        model=model,
+        max_tokens=8192,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+        output_config={"format": {"type": "json_schema", "schema": ComparisonResult.model_json_schema()}},
+    ) as stream:
+        final = stream.get_final_message()
+
+    raw_json = next(b.text for b in final.content if b.type == "text")
+    tokens_used = final.usage.input_tokens + final.usage.output_tokens
+
+    try:
+        result = ComparisonResult.model_validate_json(raw_json)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Anthropic returned invalid JSON or schema mismatch: {exc}\n"
+            f"Raw response:\n{raw_json[:500]}"
+        ) from exc
+
+    return ComparisonReport(
+        base_doc=base_doc.doc_name,
+        compare_doc=compare_doc.doc_name,
+        total_tokens_used=tokens_used,
         result=result,
     )
 
@@ -490,9 +532,11 @@ def main() -> None:
     parser.add_argument("--base",          required=True,  help="Path to base PDF document")
     parser.add_argument("--compare",       required=True,  help="Path to Word (.docx) offer document")
     parser.add_argument("--output",        default="/output/comparison_report.md", help="Output Markdown file")
-    parser.add_argument("--model",         default="gpt-oss-120b", help="Model name on your endpoint")
+    parser.add_argument("--provider",      default="auto", choices=["auto", "openai", "ollama", "anthropic"],
+                                           help="LLM backend: auto (detect from --base-url), openai, ollama, or anthropic")
+    parser.add_argument("--model",         default="gpt-oss-120b", help="Model name (use claude-opus-4-6 for Anthropic)")
     parser.add_argument("--base-url",      default=None,   help="OpenAI-compatible API base URL")
-    parser.add_argument("--api-key",       default=None,   help="API key (falls back to OPENAI_API_KEY env var)")
+    parser.add_argument("--api-key",       default=None,   help="API key (falls back to OPENAI_API_KEY / ANTHROPIC_API_KEY env var)")
     parser.add_argument("--context-limit", default=131072, type=int, help="Model context window in tokens (default: 131072)")
     args = parser.parse_args()
 
@@ -505,12 +549,14 @@ def main() -> None:
     compare_doc = infer_sections(load_docx(args.compare))
     print(f"   → {len(compare_doc.paragraphs)} paragraphs extracted")
 
-    # ── Route to Ollama or OpenAI ────────────────────────────────────────
+    # ── Resolve provider ─────────────────────────────────────────────────
     base_url = args.base_url or ""
-    is_ollama = "localhost" in base_url or "127.0.0.1" in base_url
+    provider = args.provider
+    if provider == "auto":
+        provider = "ollama" if ("localhost" in base_url or "127.0.0.1" in base_url) else "openai"
 
     print(f"\n🤖 Running full-context comparison with {args.model}…")
-    if is_ollama:
+    if provider == "ollama":
         print(f"   → Backend: Ollama ({base_url})")
         report = run_comparison_ollama(
             model=args.model,
@@ -518,6 +564,15 @@ def main() -> None:
             compare_doc=compare_doc,
             context_limit=args.context_limit,
             base_url=base_url,
+        )
+    elif provider == "anthropic":
+        print(f"   → Backend: Anthropic Claude API")
+        report = run_comparison_anthropic(
+            model=args.model,
+            base_doc=base_doc,
+            compare_doc=compare_doc,
+            context_limit=args.context_limit,
+            api_key=args.api_key,
         )
     else:
         print(f"   → Backend: OpenAI-compatible API")
