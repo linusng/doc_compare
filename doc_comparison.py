@@ -111,7 +111,7 @@ class DeviationItem(BaseModel):
 class ComparisonResult(BaseModel):
     """Top-level structured output returned by the LLM."""
     deviations: list[DeviationItem] = Field(
-        description="List of ALL clauses examined. Include only items where deviation=True."
+        description="List of ALL clauses examined, including those where deviation=False."
     )
 
     @property
@@ -429,10 +429,10 @@ def _truncate(text: str, max_chars: int = 300) -> str:
 
 
 def render_markdown(report: ComparisonReport) -> str:
-    flagged = report.result.flagged
+    all_items = report.result.deviations
 
-    if not flagged:
-        body = "_No material deviations found between the two documents._\n"
+    if not all_items:
+        body = "_No clauses examined._\n"
     else:
         header = (
             f"| # | Section "
@@ -440,13 +440,14 @@ def render_markdown(report: ComparisonReport) -> str:
             f"| Compared Doc `{report.compare_doc}` Page "
             f"| Base Document Paragraph "
             f"| Compared Document Paragraph "
+            f"| Deviation "
             f"| Comments |\n"
-            "|---|---|---|---|---|---|---|\n"
+            "|---|---|---|---|---|---|---|---|\n"
         )
         rows = []
-        for d in flagged:
-            base_pg  = f"p.{d.base_page}"  if d.base_page  else "—"
-            cmp_pg   = f"p.{d.compare_page}" if d.compare_page else "—"
+        for d in all_items:
+            base_pg = f"p.{d.base_page}"    if d.base_page    else "—"
+            cmp_pg  = f"p.{d.compare_page}" if d.compare_page else "—"
             rows.append(
                 f"| {d.item_no} "
                 f"| {d.section} "
@@ -454,6 +455,7 @@ def render_markdown(report: ComparisonReport) -> str:
                 f"| {cmp_pg} "
                 f"| {_truncate(d.base_paragraph)} "
                 f"| {_truncate(d.compare_paragraph)} "
+                f"| {'Yes' if d.deviation else 'No'} "
                 f"| {d.comments or '—'} |\n"
             )
         body = header + "".join(rows)
