@@ -5,8 +5,10 @@ description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
     "anthropic>=0.86.0",
+    "fpdf2>=2.8.7",
     "langchain-core>=1.2.23",
     "langchain-ollama>=1.0.1",
+    "langchain-openai>=1.1.12",
     "openai>=2.30.0",
     "pydantic>=2.12.5",
     "pymupdf>=1.27.2.2",
