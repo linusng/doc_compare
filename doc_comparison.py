@@ -243,19 +243,13 @@ def infer_sections(doc: PagedDocument) -> PagedDocument:
 # Token guard
 # ─────────────────────────────────────────────
 
-def estimate_tokens(text: str, model: str = "gpt-4o") -> int:
+def estimate_tokens(text: str, model: str = "") -> int:
     """
-    Estimate token count using tiktoken.
-    Falls back to a conservative word-based estimate if the model
-    encoding is not recognised (common with OSS model names).
+    Conservative character-based token estimate (≈ 4 chars/token for English).
+    Used only as a pre-flight context-limit guard — the 85% safety margin
+    absorbs estimation error across different model tokenisers.
     """
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except KeyError:
-        # OSS model names won't be in tiktoken's registry —
-        # cl100k_base is the encoding used by all recent OpenAI models
-        enc = tiktoken.get_encoding("cl100k_base")
-    return len(enc.encode(text))
+    return max(1, len(text) // 4)
 
 
 # ─────────────────────────────────────────────
