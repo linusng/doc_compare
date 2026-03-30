@@ -104,6 +104,16 @@ class SectionLabel(BaseModel):
     )
 
 
+class TargetedContext(BaseModel):
+    snippet: str = Field(
+        description=(
+            "Verbatim excerpt from the base document text that is most directly "
+            "relevant to the compare clause. Copy the text exactly as it appears; "
+            "do not paraphrase or summarize."
+        )
+    )
+
+
 class GroundingVerification(BaseModel):
     grounded: bool = Field(
         description="True if the deviation comment is fully supported by the provided clause texts."
@@ -318,6 +328,18 @@ def build_chains(llm: ChatOpenAI) -> dict:
         ),
     ) | llm.with_structured_output(SectionLabel)
 
+    targeted_context_chain = PromptTemplate(
+        input_variables=["base_text", "compare_clause"],
+        template=(
+            "From the base document text below, extract the verbatim excerpt that is "
+            "most directly relevant to the compare clause.\n\n"
+            "BASE TEXT:\n{base_text}\n\n"
+            "COMPARE CLAUSE:\n{compare_clause}\n\n"
+            "Copy the relevant excerpt exactly as it appears in the base text. "
+            "Do not paraphrase, summarize, or add any words."
+        ),
+    ) | llm.with_structured_output(TargetedContext)
+
     grounding_chain = PromptTemplate(
         input_variables=["comments", "base_clause", "compare_clause"],
         template=(
@@ -352,6 +374,7 @@ def build_chains(llm: ChatOpenAI) -> dict:
     return {
         "clause_match": clause_match_chain,
         "best_match": best_match_chain,
+        "targeted_context": targeted_context_chain,
         "deviation_classification": deviation_classification_chain,
         "section_label": section_label_chain,
         "grounding": grounding_chain,
@@ -472,30 +495,42 @@ async def compare_clause(
         base_text = base_doc.page_content
         base_page = base_doc.metadata.get("page", 0)
 
+        # ── Step 3.5: TargetedContextChain ───────────────────────────────
+        # Narrow the full-page base text down to the specific verbatim snippet
+        # most relevant to the compare clause; all downstream chains use this.
+        try:
+            targeted: TargetedContext = await chains["targeted_context"].ainvoke({
+                "base_text": base_text,
+                "compare_clause": compare_text,
+            })
+            base_snippet = targeted.snippet.strip() or base_text
+        except Exception:
+            base_snippet = base_text
+
         # ── Step 4: DeviationClassificationChain ─────────────────────────
         try:
             dev_class: DeviationClassification = await chains["deviation_classification"].ainvoke({
-                "base_clause": base_text,
+                "base_clause": base_snippet,
                 "compare_clause": compare_text,
             })
         except Exception:
-            return _no_deviation(base_text=base_text, base_pg=base_page)
+            return _no_deviation(base_text=base_snippet, base_pg=base_page)
 
         if not dev_class.has_deviation:
             try:
                 sec: SectionLabel = await chains["section_label"].ainvoke({
-                    "base_clause": base_text,
+                    "base_clause": base_snippet,
                     "compare_clause": compare_text,
                 })
                 section = sec.section
             except Exception:
                 section = "N/A"
-            return _no_deviation(section=section, base_text=base_text, base_pg=base_page)
+            return _no_deviation(section=section, base_text=base_snippet, base_pg=base_page)
 
         # ── Steps 5 & 6: SectionLabelChain (parallel) + streaming comments
         section_task = asyncio.create_task(
             chains["section_label"].ainvoke({
-                "base_clause": base_text,
+                "base_clause": base_snippet,
                 "compare_clause": compare_text,
             })
         )
@@ -503,7 +538,7 @@ async def compare_clause(
         comments = await stream_deviation_comments(
             openai_client=openai_client,
             model=model,
-            base_clause=base_text,
+            base_clause=base_snippet,
             compare_clause=compare_text,
             deviation_type=dev_class.deviation_type,
         )
@@ -518,14 +553,14 @@ async def compare_clause(
         try:
             grounding: GroundingVerification = await chains["grounding"].ainvoke({
                 "comments": comments,
-                "base_clause": base_text,
+                "base_clause": base_snippet,
                 "compare_clause": compare_text,
             })
             if not grounding.grounded and grounding.issues:
                 comments = await stream_deviation_comments(
                     openai_client=openai_client,
                     model=model,
-                    base_clause=base_text,
+                    base_clause=base_snippet,
                     compare_clause=compare_text,
                     deviation_type=dev_class.deviation_type,
                     correction_notes=grounding.issues,
@@ -538,7 +573,7 @@ async def compare_clause(
             materiality: MaterialityAssessment = await chains["materiality"].ainvoke({
                 "deviation_type": dev_class.deviation_type,
                 "comments": comments,
-                "base_clause": base_text,
+                "base_clause": base_snippet,
                 "compare_clause": compare_text,
             })
             score = materiality.score
@@ -554,7 +589,7 @@ async def compare_clause(
             section=section,
             base_page=base_page,
             compare_page=compare_page,
-            base_paragraph=base_text,
+            base_paragraph=base_snippet,
             compare_paragraph=compare_text,
             deviation=True,
             deviation_type=dev_class.deviation_type,
