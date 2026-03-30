@@ -163,22 +163,43 @@ def load_pdf(path: str) -> PagedDocument:
     return PagedDocument(doc_name=doc_name, paragraphs=paragraphs)
 
 
+_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _page_breaks_in_paragraph(para) -> int:
+    """
+    Count page breaks inside a paragraph's XML, covering two sources:
+
+    1. w:lastRenderedPageBreak — inserted automatically by Word at soft/auto
+       page-break positions when the file is saved after rendering. This is
+       what the old `run.contains_page_break` missed entirely.
+
+    2. w:br w:type="page" — explicit hard page breaks (Ctrl+Enter).
+    """
+    count = 0
+    for elem in para._p.iter():
+        local = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
+        if local == "lastRenderedPageBreak":
+            count += 1
+        elif local == "br" and elem.get(f"{{{_W}}}type") == "page":
+            count += 1
+    return count
+
+
 def load_docx(path: str) -> PagedDocument:
     """
     Extract paragraphs from a Word document.
-    Page numbers are tracked via explicit page-break detection in runs.
-    Note: python-docx cannot determine rendered page breaks from layout;
-    only explicit `w:lastRenderedPageBreak` / run page breaks are detected.
+    Page numbers are tracked by scanning each paragraph's raw XML for both
+    w:lastRenderedPageBreak (soft breaks inserted by Word on save) and
+    w:br[@w:type='page'] (explicit hard breaks).
     """
     doc_name = Path(path).name
     paragraphs: list[Paragraph] = []
     page = 1
 
     for para in DocxDocument(path).paragraphs:
+        page += _page_breaks_in_paragraph(para)
         text = para.text.strip()
-        for run in para.runs:
-            if run.contains_page_break:
-                page += 1
         if text and len(text) > 30:
             paragraphs.append(Paragraph(
                 text=text,
