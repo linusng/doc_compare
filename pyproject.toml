@@ -11,5 +11,4 @@ dependencies = [
     "pydantic>=2.12.5",
     "pymupdf>=1.27.2.2",
     "python-docx>=1.2.0",
-    "tiktoken>=0.12.0",
 ]

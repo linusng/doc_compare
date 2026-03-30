@@ -41,7 +41,6 @@ from typing import Optional
 
 import anthropic
 import fitz  # PyMuPDF
-import tiktoken
 from docx import Document as DocxDocument
 from langchain_ollama import ChatOllama
 from openai import OpenAI
