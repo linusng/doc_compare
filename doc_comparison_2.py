@@ -7,18 +7,18 @@ through a chain of focused LLM decisions before a final deviation judgment
 is made and verified.
 
 Pipeline per clause:
-  1. ClauseMatchChain      — is this clause substantive enough to look up?
-  2. similarity_search     — retrieve top-5 base clauses from InMemoryVectorStore
-  3. BestMatchChain        — pick the single best matching base clause
-  4. DeviationClassChain   — binary deviation + type (modification/omission/addition/none)
-  5. SectionLabelChain  ─┐ — 2-4 word category label          (parallel)
-  6. AsyncOpenAI stream ─┘ — stream the explanation comments
-  7. GroundingChain        — verify comments are grounded in clause text; retry once if not
-  8. MaterialityChain      — legal materiality score 1-5 + severity label
+    1. ClauseMatchChain      — is this clause substantive enough to look up?
+    2. similarity_search     — retrieve top-5 base clauses from InMemoryVectorStore
+    3. BestMatchChain        — pick the single best matching base clause
+    4. DeviationClassChain   — binary deviation + type (modification/omission/addition/none)
+    5. SectionLabelChain  ─┐ — 2-4 word category label          (parallel)
+    6. AsyncOpenAI stream ─┘ — stream the explanation comments
+    7. GroundingChain        — verify comments are grounded in clause text; retry once if not
+    8. MaterialityChain      — legal materiality score 1-5 + severity label
 
 Output table columns:
-  # | Section | Base Page | Compare Page | Base Clause | Compare Clause
-  | Deviation | Type | Materiality | Comments
+    # | Section | Base Page | Compare Page | Base Clause | Compare Clause
+    | Deviation | Type | Materiality | Comments
 
 Requirements:
     uv add fpdf2 langchain-openai langchain-ollama langchain-core httpx openai pymupdf python-docx
@@ -34,7 +34,6 @@ Usage:
 import argparse
 import asyncio
 import os
-import re
 import tempfile
 from pathlib import Path
 from typing import Literal, Optional
@@ -98,7 +97,7 @@ class DeviationClassification(BaseModel):
 class SectionLabel(BaseModel):
     section: str = Field(
         description=(
-            "Concise 2–4 word category label for the clause subject matter. "
+            "Concise 2 to 4 word category label for the clause subject matter. "
             "Examples: 'Interest Rate', 'DSCR Covenant', 'Security', 'Repayment Terms'. "
             "Never copy clause text verbatim."
         )
@@ -189,30 +188,6 @@ def _page_breaks_in_paragraph(para) -> int:
     return count
 
 
-def _looks_like_heading(text: str) -> bool:
-    words = text.split()
-    if len(words) > 12 or text.endswith("."):
-        return False
-    return (
-        text.istitle()
-        or text.isupper()
-        or bool(re.match(r"^\d+[\.\)]\s+\w", text))
-    )
-
-
-def _infer_sections(docs: list[Document]) -> list[Document]:
-    """Tag each Document with the nearest preceding heading as its section."""
-    current = "Introduction"
-    result = []
-    for doc in docs:
-        if _looks_like_heading(doc.page_content):
-            current = doc.page_content
-        result.append(Document(
-            page_content=doc.page_content,
-            metadata={**doc.metadata, "section": current},
-        ))
-    return result
-
 
 # ─────────────────────────────────────────────
 # DOCX → PDF conversion (fpdf2, no external tools)
@@ -266,23 +241,27 @@ def convert_docx_to_pdf(docx_path: str) -> str:
 
 def load_pdf_as_documents(path: str, doc_name: Optional[str] = None) -> list[Document]:
     """
-    Extract text blocks from a PDF with PyMuPDF.
-    Returns LangChain Documents with page, doc_name, and section metadata.
+    Extract text from a PDF with PyMuPDF, aggregated per page.
+    Each page produces one Document containing all its text blocks joined by newlines.
+    Returns LangChain Documents with page and doc_name metadata.
     """
     name = doc_name or Path(path).name
     docs: list[Document] = []
 
     with fitz.open(path) as pdf:
         for page_no, page in enumerate(pdf, start=1):
-            for block in page.get_text("blocks"):
-                text = block[4].strip()
-                if text and len(text) > 30:
-                    docs.append(Document(
-                        page_content=text,
-                        metadata={"page": page_no, "doc_name": name},
-                    ))
+            blocks = [
+                block[4].strip()
+                for block in page.get_text("blocks")
+                if block[4].strip()
+            ]
+            if blocks:
+                docs.append(Document(
+                    page_content="\n".join(blocks),
+                    metadata={"page": page_no, "doc_name": name},
+                ))
 
-    return _infer_sections(docs)
+    return docs
 
 
 # ─────────────────────────────────────────────
@@ -330,7 +309,7 @@ def build_chains(llm: ChatOpenAI) -> dict:
     section_label_chain = PromptTemplate(
         input_variables=["base_clause", "compare_clause"],
         template=(
-            "Provide a concise 2–4 word category label for the subject matter "
+            "Provide a concise 2 to 4 word category label for the subject matter "
             "of these two clauses.\n"
             "Examples: 'Interest Rate', 'DSCR Covenant', 'Security', 'Repayment Terms'.\n"
             "Do NOT copy text from the clauses.\n\n"
@@ -360,7 +339,7 @@ def build_chains(llm: ChatOpenAI) -> dict:
             "Comment: {comments}\n"
             "Base clause: {base_clause}\n"
             "Compare clause: {compare_clause}\n\n"
-            "Score 1–5:\n"
+            "Score 1 to 5:\n"
             "  5 = Critical (fundamental obligation or right changed)\n"
             "  4 = Major (significantly alters terms)\n"
             "  3 = Minor (noticeable but limited practical impact)\n"
@@ -441,9 +420,8 @@ async def compare_clause(
     async with semaphore:
         compare_text = compare_doc.page_content
         compare_page = compare_doc.metadata.get("page", 0)
-        section_hint = compare_doc.metadata.get("section", "General")
 
-        def _no_deviation(section: str = section_hint, base_text: str = "", base_pg: int = 0) -> DeviationItem:
+        def _no_deviation(section: str = "N/A", base_text: str = "", base_pg: int = 0) -> DeviationItem:
             return DeviationItem(
                 item_no=item_no,
                 section=section,
@@ -511,7 +489,7 @@ async def compare_clause(
                 })
                 section = sec.section
             except Exception:
-                section = section_hint
+                section = "N/A"
             return _no_deviation(section=section, base_text=base_text, base_pg=base_page)
 
         # ── Steps 5 & 6: SectionLabelChain (parallel) + streaming comments
@@ -534,7 +512,7 @@ async def compare_clause(
             sec_result: SectionLabel = await section_task
             section = sec_result.section
         except Exception:
-            section = section_hint
+            section = "N/A"
 
         # ── Step 7: GroundingChain — verify; retry once if weak ───────────
         try:
