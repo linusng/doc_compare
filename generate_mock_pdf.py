@@ -79,14 +79,54 @@ _STYLES: dict[str, dict] = {
 
 class Renderer:
     def __init__(self) -> None:
-        self.doc   = pymupdf.Document()
-        self.page  = None
-        self.y     = MARGIN_T
+        self.doc        = pymupdf.Document()
+        self.page       = None
+        self.y          = MARGIN_T
+        self._page_no   = 0
         self._new_page()
 
     def _new_page(self) -> None:
-        self.page = self.doc.new_page(width=PAGE_W, height=PAGE_H)
-        self.y = MARGIN_T
+        self.page     = self.doc.new_page(width=PAGE_W, height=PAGE_H)
+        self._page_no += 1
+        self.y         = MARGIN_T
+        self._add_header_footer()
+
+    def _add_header_footer(self) -> None:
+        """
+        Insert a running header and footer on the current page.
+        Both sit within the margin strip so parse_sections can filter them out.
+
+        Header strip: y ∈ [15, 35]  (well within top 50 pt)
+        Footer strip: y ∈ [812, 828] (well within bottom 50 pt; PAGE_H - 50 = 792)
+        """
+        # ── Running header ─────────────────────────────────────────────
+        header_rect = pymupdf.Rect(MARGIN_L, 15, PAGE_W - MARGIN_R, 35)
+        self.page.insert_textbox(
+            header_rect,
+            "CREDIT FACILITY AGREEMENT",
+            fontsize=8,
+            fontname="helv",
+            color=(0.5, 0.5, 0.5),
+            align=1,  # centre
+        )
+        # Thin rule under the header
+        self.page.draw_line(
+            pymupdf.Point(MARGIN_L, 37),
+            pymupdf.Point(PAGE_W - MARGIN_R, 37),
+            color=(0.75, 0.75, 0.75),
+            width=0.4,
+        )
+
+        # ── Running footer ─────────────────────────────────────────────
+        footer_rect = pymupdf.Rect(MARGIN_L, 812, PAGE_W - MARGIN_R, 828)
+        self.page.insert_textbox(
+            footer_rect,
+            f"Confidential  |  ABC Bank Limited  |  Page {self._page_no}",
+            fontsize=8,
+            fontname="helv",
+            color=(0.5, 0.5, 0.5),
+            align=1,  # centre
+        )
 
     def _remaining(self) -> float:
         return PAGE_H - MARGIN_B - self.y

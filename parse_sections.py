@@ -7,10 +7,15 @@ Sections at depth 1 ("1.", "2.") and depth 2 ("1.1", "2.3") each become
 a separate key. Deeper sections ("3.3.1", "3.3.2") are kept as body text
 under their parent depth-2 key rather than split out.
 
+Running headers and footers (page numbers, document title, confidentiality
+notices) are excluded by filtering any block whose bounding box lies entirely
+within the top or bottom margin strip of its page.
+
 Usage:
     python parse_sections.py input.pdf
     python parse_sections.py input.pdf --output sections.json
     python parse_sections.py input.pdf --show-keys
+    python parse_sections.py input.pdf --header-margin 60 --footer-margin 60
 """
 
 import argparse
@@ -33,6 +38,12 @@ import pymupdf
 _SECTION_RE = re.compile(r'^(\d+(?:\.\d+)*)\.?\s*(.*)')
 
 MAX_DEPTH = 2
+
+# Default margin strips (points) excluded from each page edge.
+# Standard A4/Letter headers and footers live within ~50 pt of the page edge.
+# Tune with --header-margin / --footer-margin if your document differs.
+_HEADER_MARGIN: float = 50.0
+_FOOTER_MARGIN: float = 50.0
 
 
 # ─────────────────────────────────────────────
@@ -58,18 +69,52 @@ def _normalise_key(raw: str) -> str:
 # Extraction
 # ─────────────────────────────────────────────
 
-def extract_blocks(pdf_path: str) -> list[str]:
-    """Return all non-empty text blocks from the PDF in reading order."""
+def extract_blocks(
+    pdf_path: str,
+    header_margin: float = _HEADER_MARGIN,
+    footer_margin: float = _FOOTER_MARGIN,
+) -> list[str]:
+    """Return content text blocks from the PDF in reading order.
+
+    Blocks whose bounding box lies entirely within the top ``header_margin``
+    points or the bottom ``footer_margin`` points of their page are skipped.
+    This removes running headers, running footers, and page numbers without
+    touching body content.
+
+    Parameters
+    ----------
+    pdf_path:
+        Path to the PDF file.
+    header_margin:
+        Height in points of the top strip to exclude (default 50 pt ≈ 17 mm).
+    footer_margin:
+        Height in points of the bottom strip to exclude (default 50 pt ≈ 17 mm).
+    """
     blocks: list[str] = []
     with pymupdf.open(pdf_path) as doc:
         for page in doc:
+            page_height = page.rect.height
+            footer_y    = page_height - footer_margin   # y-coordinate where footer zone begins
+
             for block in page.get_text("blocks"):
-                # block[4] is the text content; blocks 5/6 are image blocks (type!=0)
-                if block[6] != 0:        # skip image blocks
+                # block layout: (x0, y0, x1, y1, text, block_no, block_type)
+                if block[6] != 0:           # skip image blocks
                     continue
+
+                y0, y1 = block[1], block[3]
+
+                # Skip if the block sits entirely within the header strip
+                if y1 <= header_margin:
+                    continue
+
+                # Skip if the block sits entirely within the footer strip
+                if y0 >= footer_y:
+                    continue
+
                 text = block[4].strip()
                 if text:
                     blocks.append(text)
+
     return blocks
 
 
@@ -152,6 +197,18 @@ def main() -> None:
         action="store_true",
         help="Print only the detected section keys, not the full text",
     )
+    parser.add_argument(
+        "--header-margin",
+        type=float,
+        default=_HEADER_MARGIN,
+        help=f"Points to exclude from the top of each page (default: {_HEADER_MARGIN})",
+    )
+    parser.add_argument(
+        "--footer-margin",
+        type=float,
+        default=_FOOTER_MARGIN,
+        help=f"Points to exclude from the bottom of each page (default: {_FOOTER_MARGIN})",
+    )
     args = parser.parse_args()
 
     pdf_path = Path(args.input)
@@ -159,7 +216,11 @@ def main() -> None:
         print(f"Error: file not found: {pdf_path}", file=sys.stderr)
         sys.exit(1)
 
-    blocks = extract_blocks(str(pdf_path))
+    blocks = extract_blocks(
+        str(pdf_path),
+        header_margin=args.header_margin,
+        footer_margin=args.footer_margin,
+    )
     sections = parse_sections(blocks)
 
     if args.show_keys:
