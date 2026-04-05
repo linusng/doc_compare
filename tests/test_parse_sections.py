@@ -166,6 +166,29 @@ class TestParseSections:
         result = parse_sections(blocks)
         assert "1" in result
 
+    def test_bare_integer_not_a_section_key(self):
+        # A block that starts with a bare integer (e.g. a page number) must NOT
+        # become a section key — only numbers with a period qualify.
+        blocks = [
+            "1. Introduction\nOverview text.",
+            "42",                              # page number — bare integer, no period
+            "More body text here.",
+        ]
+        result = parse_sections(blocks)
+        assert "42" not in result
+        # The bare integer block should be folded into section "1" as body text
+        assert "1" in result
+
+    def test_page_number_text_folded_into_current_section(self):
+        # Body text after a bare-integer page-number block stays under the same key.
+        blocks = [
+            "2. Definitions\nDefined terms.",
+            "5",          # page number
+            "Continued body text.",
+        ]
+        result = parse_sections(blocks)
+        assert "Continued body text." in result["2"]
+
 
 # ─────────────────────────────────────────────
 # TestExtractBlocks
@@ -207,99 +230,6 @@ class TestExtractBlocks:
             assert blocks == []
         finally:
             Path(tmp.name).unlink(missing_ok=True)
-
-
-# ─────────────────────────────────────────────
-# TestMarginFiltering
-# ─────────────────────────────────────────────
-
-def _make_pdf_with_blocks(block_positions: list[tuple[float, str]]) -> str:
-    """
-    Write a PDF where each tuple is (y_position, text).
-    Page height is the PyMuPDF default (842 pt for A4).
-    """
-    doc = pymupdf.Document()
-    page = doc.new_page(width=595, height=842)
-    for y, text in block_positions:
-        page.insert_text((50, y), text, fontsize=10)
-    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-    doc.save(tmp.name)
-    tmp.close()
-    return tmp.name
-
-
-class TestMarginFiltering:
-    # Page height = 842 pt.  Default margins: header=50, footer=50.
-    # Footer zone starts at y0 >= 842 - 50 = 792.
-
-    def test_header_block_excluded(self):
-        """A block whose bottom edge (y1) falls within the top 50 pt is skipped."""
-        # insert_text puts the baseline at y; for fontsize=10 the block y0≈y-10, y1≈y
-        # Place the text so its entire bbox is in [0, 50]: baseline at y=40
-        path = _make_pdf_with_blocks([(40, "HEADER TEXT")])
-        try:
-            blocks = extract_blocks(path)
-            assert not any("HEADER TEXT" in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_footer_block_excluded(self):
-        """A block whose top edge (y0) is at or beyond the footer threshold is skipped."""
-        # Baseline at 830 → y0 ≈ 820, well past the 792 threshold.
-        path = _make_pdf_with_blocks([(830, "Page 1")])
-        try:
-            blocks = extract_blocks(path)
-            assert not any("Page 1" in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_body_block_near_top_included(self):
-        """A block just outside the header margin (y > 50) is kept."""
-        # Baseline at 120 → bbox safely below header margin
-        path = _make_pdf_with_blocks([(120, "1. Introduction")])
-        try:
-            blocks = extract_blocks(path)
-            assert any("Introduction" in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_body_block_near_bottom_included(self):
-        """A block that ends before the footer zone is kept."""
-        # Baseline at 750 → y0 ≈ 740, below footer threshold of 792
-        path = _make_pdf_with_blocks([(750, "Last body line.")])
-        try:
-            blocks = extract_blocks(path)
-            assert any("Last body line." in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_zero_header_margin_includes_all_top_blocks(self):
-        """header_margin=0 disables header filtering — top blocks are kept."""
-        path = _make_pdf_with_blocks([(40, "TOP CONTENT")])
-        try:
-            blocks = extract_blocks(path, header_margin=0)
-            assert any("TOP CONTENT" in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_zero_footer_margin_includes_all_bottom_blocks(self):
-        """footer_margin=0 disables footer filtering — bottom blocks are kept."""
-        path = _make_pdf_with_blocks([(830, "BOTTOM CONTENT")])
-        try:
-            blocks = extract_blocks(path, footer_margin=0)
-            assert any("BOTTOM CONTENT" in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_custom_large_margin_excludes_body(self):
-        """With a very large header_margin, body text near the top is also excluded."""
-        # Baseline at 200 → y1 ≈ 200; excluded when header_margin=250
-        path = _make_pdf_with_blocks([(200, "Body text.")])
-        try:
-            blocks = extract_blocks(path, header_margin=250)
-            assert not any("Body text." in b for b in blocks)
-        finally:
-            Path(path).unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────
@@ -361,26 +291,15 @@ class TestIntegration:
         assert "65%"  in text   # LTV cap
         assert "2.00" in text   # ICR floor
 
-    def test_header_footer_text_absent_from_sections(self, sections):
-        """Footer sentinel text must not appear in parsed sections."""
-        all_text = " ".join(sections.values())
-        # The mock PDF footer is: "Confidential  |  ABC Bank Limited  |  Page N"
-        # The pipe-separated pattern only appears in the footer strip, never in body text.
-        assert "Confidential  |" not in all_text, \
-            "Footer text leaked into section content"
+    def test_bare_page_numbers_not_section_keys(self, sections):
+        """Bare integers (page numbers) must never become section keys.
 
-    def test_section_count_with_margins(self):
-        """Parsing with default margins yields the same section count as without
-        margins (when the mock PDF has no body text inside the margin strips)."""
-        blocks_filtered   = extract_blocks(str(MOCK_PDF))
-        blocks_no_margins = extract_blocks(str(MOCK_PDF), header_margin=0, footer_margin=0)
-        # With the mock PDF, body starts at y≈80 so both calls should return
-        # the same body blocks; the only difference is header/footer blocks.
-        secs_filtered   = parse_sections(blocks_filtered)
-        secs_no_margins = parse_sections(blocks_no_margins)
-        # The filtered parse must contain all expected body sections.
-        for key in ["1", "2", "3", "3.1", "3.3", "4.1"]:
-            assert key in secs_filtered, f"Section {key!r} missing after filtering"
-        # The unfiltered parse may have extra noise keys but must have at least
-        # as many sections as the filtered one.
-        assert len(secs_no_margins) >= len(secs_filtered)
+        The mock document has 6 sections, so any purely-numeric key above 6
+        would indicate a stray page number was mistakenly promoted to a key.
+        """
+        expected_top_level = {"1", "2", "3", "4", "5", "6"}
+        numeric_keys = {k for k in sections if k.isdigit()}
+        unexpected = numeric_keys - expected_top_level
+        assert not unexpected, (
+            f"Unexpected numeric keys (likely stray page numbers): {unexpected}"
+        )

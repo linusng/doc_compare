@@ -7,15 +7,16 @@ Sections at depth 1 ("1.", "2.") and depth 2 ("1.1", "2.3") each become
 a separate key. Deeper sections ("3.3.1", "3.3.2") are kept as body text
 under their parent depth-2 key rather than split out.
 
-Running headers and footers (page numbers, document title, confidentiality
-notices) are excluded by filtering any block whose bounding box lies entirely
-within the top or bottom margin strip of its page.
+A block is only treated as a section heading if its leading number contains
+at least one period — either a trailing dot ("2.", "14.") or an internal dot
+("1.1", "3.3.2"). Bare integers ("42") are never promoted to section keys,
+so page numbers embedded in the text are silently folded into the current
+section's body rather than starting a new one.
 
 Usage:
     python parse_sections.py input.pdf
     python parse_sections.py input.pdf --output sections.json
     python parse_sections.py input.pdf --show-keys
-    python parse_sections.py input.pdf --header-margin 60 --footer-margin 60
 """
 
 import argparse
@@ -31,19 +32,16 @@ import pymupdf
 # Constants
 # ─────────────────────────────────────────────
 
-# Matches section numbers at the very start of a line:
-#   "1."  "1.1"  "1.1.1"  "3.3.2"  (trailing dot optional)
+# Matches section numbers at the very start of a line.
+# A valid section number MUST contain at least one period — either:
+#   • a trailing dot:   "1."  "14."
+#   • internal dot(s):  "1.1"  "3.3.2"
+# Bare integers like "42" (page numbers) are intentionally excluded.
 # Group 1 → raw section number (e.g. "1.", "1.1", "3.3.1")
 # Group 2 → heading text on the same line (may be empty for stand-alone number lines)
-_SECTION_RE = re.compile(r'^(\d+(?:\.\d+)*)\.?\s*(.*)')
+_SECTION_RE = re.compile(r'^(\d+(?:\.\d+)+\.?|\d+\.)\s*(.*)')
 
 MAX_DEPTH = 2
-
-# Default margin strips (points) excluded from each page edge.
-# Standard A4/Letter headers and footers live within ~50 pt of the page edge.
-# Tune with --header-margin / --footer-margin if your document differs.
-_HEADER_MARGIN: float = 50.0
-_FOOTER_MARGIN: float = 50.0
 
 
 # ─────────────────────────────────────────────
@@ -69,48 +67,21 @@ def _normalise_key(raw: str) -> str:
 # Extraction
 # ─────────────────────────────────────────────
 
-def extract_blocks(
-    pdf_path: str,
-    header_margin: float = _HEADER_MARGIN,
-    footer_margin: float = _FOOTER_MARGIN,
-) -> list[str]:
+def extract_blocks(pdf_path: str) -> list[str]:
     """Return content text blocks from the PDF in reading order.
 
-    Blocks whose bounding box lies entirely within the top ``header_margin``
-    points or the bottom ``footer_margin`` points of their page are skipped.
-    This removes running headers, running footers, and page numbers without
-    touching body content.
-
-    Parameters
-    ----------
-    pdf_path:
-        Path to the PDF file.
-    header_margin:
-        Height in points of the top strip to exclude (default 50 pt ≈ 17 mm).
-    footer_margin:
-        Height in points of the bottom strip to exclude (default 50 pt ≈ 17 mm).
+    Image blocks are skipped; all text blocks are returned as-is.
+    Page numbers and other bare integers in the text are handled at the
+    parsing stage: ``_SECTION_RE`` requires a period so they are never
+    promoted to section keys.
     """
     blocks: list[str] = []
     with pymupdf.open(pdf_path) as doc:
         for page in doc:
-            page_height = page.rect.height
-            footer_y    = page_height - footer_margin   # y-coordinate where footer zone begins
-
             for block in page.get_text("blocks"):
                 # block layout: (x0, y0, x1, y1, text, block_no, block_type)
                 if block[6] != 0:           # skip image blocks
                     continue
-
-                y0, y1 = block[1], block[3]
-
-                # Skip if the block sits entirely within the header strip
-                if y1 <= header_margin:
-                    continue
-
-                # Skip if the block sits entirely within the footer strip
-                if y0 >= footer_y:
-                    continue
-
                 text = block[4].strip()
                 if text:
                     blocks.append(text)
@@ -197,18 +168,6 @@ def main() -> None:
         action="store_true",
         help="Print only the detected section keys, not the full text",
     )
-    parser.add_argument(
-        "--header-margin",
-        type=float,
-        default=_HEADER_MARGIN,
-        help=f"Points to exclude from the top of each page (default: {_HEADER_MARGIN})",
-    )
-    parser.add_argument(
-        "--footer-margin",
-        type=float,
-        default=_FOOTER_MARGIN,
-        help=f"Points to exclude from the bottom of each page (default: {_FOOTER_MARGIN})",
-    )
     args = parser.parse_args()
 
     pdf_path = Path(args.input)
@@ -216,11 +175,7 @@ def main() -> None:
         print(f"Error: file not found: {pdf_path}", file=sys.stderr)
         sys.exit(1)
 
-    blocks = extract_blocks(
-        str(pdf_path),
-        header_margin=args.header_margin,
-        footer_margin=args.footer_margin,
-    )
+    blocks = extract_blocks(str(pdf_path))
     sections = parse_sections(blocks)
 
     if args.show_keys:
