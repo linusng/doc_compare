@@ -2,7 +2,9 @@
 Unit tests for parse_schedule.py
 """
 
-from parse_schedule import parse_schedules
+import re
+
+from parse_schedule import _DEFAULT_STOP_RE, parse_schedules
 
 
 class TestParseSchedules:
@@ -96,3 +98,151 @@ class TestParseSchedules:
         for n in range(1, 6):
             assert f"Schedule {n}" in result
             assert f"Content {n}." in result[f"Schedule {n}"]
+
+
+# ─────────────────────────────────────────────
+# TestStopPatternOptionA
+# ─────────────────────────────────────────────
+
+class TestStopPatternOptionA:
+    """Option A: stop_pattern terminates the last schedule."""
+
+    def _blocks_with_trailer(self, trailer_line: str) -> list[str]:
+        return [
+            "Schedule 8\nSchedule 8 body.",
+            "Schedule 9\nSchedule 9 body.",
+            trailer_line,
+            "Post-schedule content that must NOT appear in Schedule 9.",
+        ]
+
+    def test_signed_by_stops_collection(self):
+        blocks = self._blocks_with_trailer("SIGNED BY the parties as follows:")
+        result = parse_schedules(blocks)
+        assert "Post-schedule content" not in result.get("Schedule 9", "")
+
+    def test_executed_stops_collection(self):
+        blocks = self._blocks_with_trailer("Executed as a deed by ABC Bank")
+        result = parse_schedules(blocks)
+        assert "Post-schedule content" not in result.get("Schedule 9", "")
+
+    def test_in_witness_whereof_stops_collection(self):
+        blocks = self._blocks_with_trailer("IN WITNESS WHEREOF the parties have executed")
+        result = parse_schedules(blocks)
+        assert "Post-schedule content" not in result.get("Schedule 9", "")
+
+    def test_signatories_stops_collection(self):
+        blocks = self._blocks_with_trailer("Signatories")
+        result = parse_schedules(blocks)
+        assert "Post-schedule content" not in result.get("Schedule 9", "")
+
+    def test_authorised_signatory_stops_collection(self):
+        blocks = self._blocks_with_trailer("Authorised Signatory:")
+        result = parse_schedules(blocks)
+        assert "Post-schedule content" not in result.get("Schedule 9", "")
+
+    def test_annexure_stops_collection(self):
+        blocks = self._blocks_with_trailer("Annexure A – Additional Terms")
+        result = parse_schedules(blocks)
+        assert "Post-schedule content" not in result.get("Schedule 9", "")
+
+    def test_schedule_9_body_still_captured_before_stop(self):
+        blocks = self._blocks_with_trailer("SIGNED BY the parties as follows:")
+        result = parse_schedules(blocks)
+        assert "Schedule 9 body." in result["Schedule 9"]
+
+    def test_stop_pattern_none_disables_option_a(self):
+        # With stop_pattern=None the trailer is absorbed into Schedule 9
+        blocks = self._blocks_with_trailer("SIGNED BY the parties:")
+        result = parse_schedules(blocks, stop_pattern=None)
+        assert "Post-schedule content" in result.get("Schedule 9", "")
+
+    def test_custom_stop_pattern(self):
+        blocks = [
+            "Schedule 1\nBody of schedule 1.",
+            "END OF SCHEDULES",
+            "This must not appear in Schedule 1.",
+        ]
+        result = parse_schedules(
+            blocks,
+            stop_pattern=re.compile(r'^END OF SCHEDULES', re.IGNORECASE),
+        )
+        assert "This must not appear" not in result["Schedule 1"]
+        assert "END OF SCHEDULES" not in result["Schedule 1"]
+
+    def test_stop_before_any_schedule_is_harmless(self):
+        # Stop pattern fires before any schedule — since we are not inside a
+        # schedule yet, it is ignored and parsing continues normally.
+        blocks = [
+            "SIGNED BY the parties:",
+            "Schedule 1\nSome content.",
+        ]
+        result = parse_schedules(blocks)
+        assert "Schedule 1" in result
+        assert "Some content." in result["Schedule 1"]
+
+    def test_default_stop_re_does_not_match_mid_body_text(self):
+        # Words like "signed" appearing mid-sentence inside body should not
+        # trigger the stop (the regex anchors at the start of the line).
+        blocks = [
+            "Schedule 1\nThis agreement was signed last year.",
+            "More body text.",
+        ]
+        result = parse_schedules(blocks)
+        assert "More body text." in result["Schedule 1"]
+
+
+# ─────────────────────────────────────────────
+# TestStopOnNumberedSectionOptionB
+# ─────────────────────────────────────────────
+
+class TestStopOnNumberedSectionOptionB:
+    """Option B: stop_on_numbered_section terminates when a depth-1 section appears."""
+
+    def test_numbered_section_after_last_schedule_stops_collection(self):
+        blocks = [
+            "Schedule 9\nSchedule 9 body.",
+            "1. Execution\nExecution block text.",
+            "Signature lines here.",
+        ]
+        result = parse_schedules(blocks, stop_on_numbered_section=True)
+        assert "Execution block text." not in result.get("Schedule 9", "")
+        assert "Signature lines" not in result.get("Schedule 9", "")
+
+    def test_schedule_9_body_captured_before_section_trigger(self):
+        blocks = [
+            "Schedule 9\nSchedule 9 body.",
+            "1. Execution\nExecution block.",
+        ]
+        result = parse_schedules(blocks, stop_on_numbered_section=True)
+        assert "Schedule 9 body." in result["Schedule 9"]
+
+    def test_option_b_off_by_default_numbered_section_absorbed(self):
+        # Without the flag, a numbered section is just body text
+        blocks = [
+            "Schedule 9\nSchedule 9 body.",
+            "1. Execution\nThis would be absorbed.",
+        ]
+        result = parse_schedules(blocks)  # stop_on_numbered_section defaults to False
+        assert "This would be absorbed." in result["Schedule 9"]
+
+    def test_depth_2_section_does_not_trigger_option_b(self):
+        # Only depth-1 headings (e.g. "1.") trigger; "1.1" should not
+        blocks = [
+            "Schedule 1\nSchedule content.",
+            "1.1 Sub-condition\nDetail text.",
+            "More schedule content.",
+        ]
+        result = parse_schedules(blocks, stop_on_numbered_section=True)
+        assert "More schedule content." in result["Schedule 1"]
+
+    def test_option_a_and_b_both_active(self):
+        # When both are enabled, whichever fires first wins
+        blocks = [
+            "Schedule 9\nBody.",
+            "SIGNED BY ABC Bank",   # Option A fires here
+            "1. Execution",         # Option B would fire here but never reached
+            "Post content.",
+        ]
+        result = parse_schedules(blocks, stop_on_numbered_section=True)
+        assert "Post content." not in result.get("Schedule 9", "")
+        assert "Body." in result["Schedule 9"]
