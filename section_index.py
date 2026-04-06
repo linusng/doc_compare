@@ -37,6 +37,7 @@ Combining sections and schedules
 """
 
 import json
+import re
 import os
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_openai import OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 # ─────────────────────────────────────────────
@@ -162,6 +164,135 @@ def query_store_with_score(
         Number of results to return.
     """
     return store.similarity_search_with_score(query, k=k)
+
+
+# ─────────────────────────────────────────────
+# Chunking
+# ─────────────────────────────────────────────
+
+# BGE-M3 token limit is 8192.  Legal English averages ~3.5 chars/token, so
+# 8192 tokens ≈ 28,000 chars.  A chunk_size of 21,000 chars (~6,000 tokens)
+# gives comfortable headroom; chunk_overlap of 800 chars preserves cross-
+# boundary context.
+_DEFAULT_CHUNK_SIZE    = 21_000
+_DEFAULT_CHUNK_OVERLAP =    800
+
+
+def _base_key(key: str) -> str:
+    """Strip the chunk suffix from a key, if present.
+
+    "3.3 [2/4]"  →  "3.3"
+    "Schedule 1" →  "Schedule 1"  (unchanged)
+    """
+    return re.sub(r'\s+\[\d+/\d+\]$', '', key)
+
+
+def chunk_sections(
+    sections: dict[str, str],
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = _DEFAULT_CHUNK_OVERLAP,
+) -> dict[str, str]:
+    """
+    Split any section whose text exceeds ``chunk_size`` characters into
+    overlapping chunks using ``RecursiveCharacterTextSplitter``.
+
+    Sections that fit within the limit are returned unchanged under their
+    original key.  Sections that are split receive keys of the form
+    ``"{original_key} [{n}/{total}]"`` (e.g. ``"3.3 [1/3]"``).
+
+    Parameters
+    ----------
+    sections:
+        Dict of {section_key: section_text} as returned by a parser.
+    chunk_size:
+        Maximum characters per chunk.  Defaults to 21,000 (~6,000 BGE-M3
+        tokens), well within the 8,192-token limit.
+    chunk_overlap:
+        Character overlap between consecutive chunks to preserve context
+        at boundaries.  Defaults to 800 chars (~230 tokens).
+
+    Returns
+    -------
+    dict[str, str]
+        Expanded mapping where long sections are replaced by their chunks.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+    )
+
+    result: dict[str, str] = {}
+    for key, text in sections.items():
+        if len(text) <= chunk_size:
+            result[key] = text
+        else:
+            chunks = splitter.split_text(text)
+            if len(chunks) == 1:
+                # Splitter kept it whole (e.g. no split points found)
+                result[key] = chunks[0]
+            else:
+                total = len(chunks)
+                for i, chunk in enumerate(chunks, start=1):
+                    result[f"{key} [{i}/{total}]"] = chunk
+    return result
+
+
+# ─────────────────────────────────────────────
+# Deduplication
+# ─────────────────────────────────────────────
+
+def deduplicate_results(results: list[Document]) -> list[Document]:
+    """
+    Collapse multiple chunk hits from the same parent section into one.
+
+    When ``chunk_sections`` has been used, a single query may match several
+    chunks of the same section (e.g. ``"3.3 [1/3]"`` and ``"3.3 [2/3]"``).
+    This function keeps only the first occurrence of each base key, since
+    results are already ranked by similarity score (highest first).
+
+    Parameters
+    ----------
+    results:
+        Output of ``query_store``.
+
+    Returns
+    -------
+    list[Document]
+        Deduplicated list preserving original rank order.
+    """
+    seen:   set[str]      = set()
+    unique: list[Document] = []
+    for doc in results:
+        base = _base_key(doc.metadata["key"])
+        if base not in seen:
+            seen.add(base)
+            unique.append(doc)
+    return unique
+
+
+def deduplicate_results_with_score(
+    results: list[tuple[Document, float]],
+) -> list[tuple[Document, float]]:
+    """
+    Collapse multiple chunk hits from the same parent section into one,
+    keeping the chunk with the highest similarity score for each section.
+
+    Parameters
+    ----------
+    results:
+        Output of ``query_store_with_score``.
+
+    Returns
+    -------
+    list[tuple[Document, float]]
+        Deduplicated list, re-sorted by score descending.
+    """
+    best: dict[str, tuple[Document, float]] = {}
+    for doc, score in results:
+        base = _base_key(doc.metadata["key"])
+        if base not in best or score > best[base][1]:
+            best[base] = (doc, score)
+    return sorted(best.values(), key=lambda x: x[1], reverse=True)
 
 
 # ─────────────────────────────────────────────
