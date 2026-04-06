@@ -330,7 +330,7 @@ if __name__ == "__main__":
         "--k",
         type=int,
         default=5,
-        help="Number of results to return (default: 5)",
+        help="Number of results to return after deduplication (default: 5)",
     )
     parser.add_argument(
         "--scores",
@@ -353,6 +353,18 @@ if __name__ == "__main__":
         default=300,
         help="Number of content characters to preview per result (default: 300)",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=_DEFAULT_CHUNK_SIZE,
+        help=f"Max characters per chunk (default: {_DEFAULT_CHUNK_SIZE})",
+    )
+    parser.add_argument(
+        "--chunk-overlap",
+        type=int,
+        default=_DEFAULT_CHUNK_OVERLAP,
+        help=f"Overlap characters between chunks (default: {_DEFAULT_CHUNK_OVERLAP})",
+    )
     args = parser.parse_args()
 
     json_path = Path(args.json_file)
@@ -360,32 +372,54 @@ if __name__ == "__main__":
         print(f"Error: file not found: {json_path}", file=sys.stderr)
         sys.exit(1)
 
+    # ── 1. Load ───────────────────────────────────────────────────────────
     print(f"Loading sections from {json_path.name} ...", flush=True)
     sections = load_json(json_path)
     print(f"  {len(sections)} sections loaded.", flush=True)
 
-    print("Building vector store ...", flush=True)
-    embeddings = make_embeddings(
-        model=args.model,
-        base_url=args.base_url,
+    # ── 2. Chunk long sections ────────────────────────────────────────────
+    chunked = chunk_sections(
+        sections,
+        chunk_size=args.chunk_size,
+        chunk_overlap=args.chunk_overlap,
     )
-    store = build_store(sections, embeddings, source=json_path.stem)
-    print(f"  Store ready ({len(sections)} documents).", flush=True)
+    n_split = len(chunked) - len(sections)
+    if n_split > 0:
+        print(f"  {n_split} extra chunk(s) created for sections exceeding "
+              f"{args.chunk_size:,} chars.", flush=True)
+    else:
+        print(f"  All sections within chunk size limit — no splitting needed.",
+              flush=True)
+
+    # ── 3. Build store ────────────────────────────────────────────────────
+    print("Building vector store ...", flush=True)
+    embeddings = make_embeddings(model=args.model, base_url=args.base_url)
+    store = build_store(chunked, embeddings, source=json_path.stem)
+    print(f"  Store ready ({len(chunked)} document(s)).", flush=True)
+
+    # ── 4. Query & deduplicate ────────────────────────────────────────────
+    # Fetch more candidates than k before deduplication so that after
+    # collapsing chunks we still have k unique section results.
+    fetch_k = args.k * 4
 
     print(f'\nQuery: "{args.query}"')
-    print(f"Top {args.k} results:\n" + "─" * 60)
+    print(f"Top {args.k} results (after deduplication):\n" + "─" * 60)
 
     if args.scores:
-        results = query_store_with_score(store, args.query, k=args.k)
+        raw     = query_store_with_score(store, args.query, k=fetch_k)
+        results = deduplicate_results_with_score(raw)[: args.k]
         for rank, (doc, score) in enumerate(results, start=1):
+            base    = _base_key(doc.metadata["key"])
             preview = doc.page_content[: args.preview].replace("\n", " ")
-            print(f"[{rank}] {doc.metadata['key']}  (score: {score:.4f})")
+            print(f"[{rank}] {base}  (score: {score:.4f})")
             print(f"    {preview}")
             print()
     else:
-        results = query_store(store, args.query, k=args.k)
+        raw     = query_store(store, args.query, k=fetch_k)
+        results = deduplicate_results(raw)[: args.k]
         for rank, doc in enumerate(results, start=1):
+            base    = _base_key(doc.metadata["key"])
             preview = doc.page_content[: args.preview].replace("\n", " ")
-            print(f"[{rank}] {doc.metadata['key']}")
+            print(f"[{rank}] {base}")
             print(f"    {preview}")
             print()
