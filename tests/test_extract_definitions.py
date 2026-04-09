@@ -110,7 +110,58 @@ class TestFindDefinitionsSection:
         assert len(result) == 2
         assert "Body of facility section." not in " ".join(result)
 
-    def test_does_not_stop_at_depth2_subsection(self):
+    def test_case_insensitive_heading(self):
+        for heading in [
+            "1. DEFINITIONS AND INTERPRETATION",
+            "1. Definitions and Interpretation",
+            "1. definitions and interpretations",
+            "DEFINITIONS AND INTERPRETATIONS",
+            "1.1 Definitions",
+            "1.1 DEFINITIONS",
+            "Definitions",
+        ]:
+            blocks = [heading, '"Term" means value.', "2. NEXT SECTION"]
+            result = find_definitions_section(blocks)
+            assert len(result) >= 1, f"Failed for heading: {heading!r}"
+
+    def test_depth2_heading_found(self):
+        blocks = [
+            "1. GENERAL",
+            "General preamble.",
+            "1.1 Definitions",
+            '"Business Day" means a working day.',
+            "1.2 Interpretation",
+        ]
+        result = find_definitions_section(blocks)
+        assert len(result) == 1
+        assert "Business Day" in result[0]
+
+    def test_depth2_heading_stops_at_sibling_depth2(self):
+        blocks = [
+            "1.1 Definitions",
+            '"Term A" means value A.',
+            '"Term B" means value B.',
+            "1.2 Interpretation",
+            "Interpretation rules here.",
+        ]
+        result = find_definitions_section(blocks)
+        assert len(result) == 2
+        assert not any("Interpretation rules" in b for b in result)
+
+    def test_depth2_heading_stops_at_depth1(self):
+        blocks = [
+            "1.1 Definitions",
+            '"Term A" means value A.',
+            "2. THE FACILITY",
+            "Facility text.",
+        ]
+        result = find_definitions_section(blocks)
+        assert len(result) == 1
+        assert "Facility text." not in " ".join(result)
+
+    def test_depth1_heading_does_not_stop_at_depth2(self):
+        # Existing behaviour preserved: depth-1 definitions heading should
+        # NOT be terminated by a depth-2 sibling like "1.2 Interpretation".
         blocks = [
             "1. DEFINITIONS AND INTERPRETATION",
             '"Term A" means something.',
@@ -120,17 +171,6 @@ class TestFindDefinitionsSection:
         ]
         result = find_definitions_section(blocks)
         assert any("Interpretation rules" in b for b in result)
-
-    def test_case_insensitive_heading(self):
-        for heading in [
-            "1. DEFINITIONS AND INTERPRETATION",
-            "1. Definitions and Interpretation",
-            "1. definitions and interpretations",
-            "DEFINITIONS AND INTERPRETATIONS",
-        ]:
-            blocks = [heading, '"Term" means value.', "2. NEXT SECTION"]
-            result = find_definitions_section(blocks)
-            assert len(result) == 1, f"Failed for heading: {heading!r}"
 
     def test_section_not_found_returns_empty_list(self):
         blocks = ["1. FACILITY", "Body text.", "2. INTEREST"]

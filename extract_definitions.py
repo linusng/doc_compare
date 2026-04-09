@@ -54,10 +54,11 @@ import pymupdf
 
 # Matches the definitions section heading anywhere in a line.
 # Handles: "1. DEFINITIONS AND INTERPRETATION"
+#          "1.1 Definitions"
 #          "Definitions and Interpretations"
 #          "DEFINITIONS AND INTERPRETATION"
 _DEF_SECTION_RE = re.compile(
-    r'definitions?\s+and\s+interpret',
+    r'definitions?\s+and\s+interpret|\bdefinitions?\s*$',
     re.IGNORECASE,
 )
 
@@ -65,6 +66,10 @@ _DEF_SECTION_RE = re.compile(
 # "2. " "10. " etc.  Does NOT match "1.1 " (depth-2) because the digit
 # after the first dot is immediately followed by a space only for depth-1.
 _DEPTH1_SECTION_RE = re.compile(r'^\d+\.\s')
+
+# Matches a depth-2 section heading at the start of a line:
+# "1.1 " "1.2 " "10.3 " etc.
+_DEPTH2_SECTION_RE = re.compile(r'^\d+\.\d+')
 
 # Matches a quoted term at the very start of a block's first line.
 # Handles straight quotes (") and typographic/smart quotes (" " ' ' « »).
@@ -119,8 +124,11 @@ def find_definitions_section(blocks: list[str]) -> list[str]:
     Locate and return the blocks that belong to the definitions section.
 
     The section begins on the block AFTER the first heading that matches
-    ``_DEF_SECTION_RE``.  It ends immediately before the next depth-1
-    numbered section heading (e.g. "2. THE FACILITY").
+    ``_DEF_SECTION_RE`` (covers "1. Definitions and Interpretation",
+    "1.1 Definitions", bare "Definitions", etc.).  It ends immediately
+    before the next section heading at the same depth or higher — depth-1
+    (e.g. "2. THE FACILITY") always stops; depth-2 (e.g. "1.2 Interpretation")
+    stops only when the definitions heading was itself depth-2.
 
     Parameters
     ----------
@@ -134,7 +142,8 @@ def find_definitions_section(blocks: list[str]) -> list[str]:
         heading line itself.  Returns an empty list if the section is not
         found.
     """
-    start_idx: int | None = None
+    start_idx:        int | None = None
+    heading_is_depth2: bool      = False
 
     for i, block in enumerate(blocks):
         first_line = block.splitlines()[0].strip()
@@ -142,15 +151,18 @@ def find_definitions_section(blocks: list[str]) -> list[str]:
         if start_idx is None:
             # Look for the definitions heading
             if _DEF_SECTION_RE.search(first_line):
-                start_idx = i + 1       # content starts after the heading
+                start_idx        = i + 1       # content starts after the heading
+                heading_is_depth2 = bool(_DEPTH2_SECTION_RE.match(first_line))
         else:
-            # Stop at the next depth-1 section that is NOT the definitions
-            # section itself (guards against "1. Definitions and Interpretation"
-            # appearing again as a cross-reference heading)
-            if (
-                _DEPTH1_SECTION_RE.match(first_line)
-                and not _DEF_SECTION_RE.search(first_line)
-            ):
+            # Stop at the next section heading that is NOT the definitions
+            # section itself.  When the definitions heading was depth-2
+            # (e.g. "1.1 Definitions"), also stop at sibling depth-2 headings
+            # (e.g. "1.2 Interpretation").  When it was depth-1, only depth-1
+            # headings terminate the section (existing behaviour).
+            is_depth1 = bool(_DEPTH1_SECTION_RE.match(first_line))
+            is_depth2 = bool(_DEPTH2_SECTION_RE.match(first_line))
+            is_section = (is_depth1 or (heading_is_depth2 and is_depth2))
+            if is_section and not _DEF_SECTION_RE.search(first_line):
                 return blocks[start_idx:i]
 
     if start_idx is None:
