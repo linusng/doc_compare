@@ -97,3 +97,60 @@ def get_strikethrough_rects_any_color(page):
                     break
 
     return struck_rects
+
+def is_red(color):
+    if not color or len(color) != 3:
+        return False
+    r, g, b = color
+    return r > 0.5 and g < 0.4 and b < 0.4
+
+def is_blue(color):
+    if not color or len(color) != 3:
+        return False
+    r, g, b = color
+    return b > 0.5 and r < 0.4 and g < 0.6
+
+def get_strikethrough_rects(page, max_line_height=3.0):
+    struck_rects = []
+    for d in page.get_drawings():
+        rect = d["rect"]
+        color = d.get("color") or d.get("fill")
+
+        is_thin = rect.height <= max_line_height
+        is_horizontal = rect.width > rect.height * 3
+        is_red_color = is_red(color)
+        is_blue_color = is_blue(color)
+
+        # Only flag red lines; explicitly skip blue (underlines to preserve)
+        if is_thin and is_horizontal and is_red_color and not is_blue_color:
+            struck_rects.append(rect)
+
+    return struck_rects
+
+def get_strikethrough_rects(page, max_line_height=3.0):
+    struck_rects = []
+    words = page.get_text("words")
+
+    for d in page.get_drawings():
+        rect = d["rect"]
+        color = d.get("color") or d.get("fill")
+
+        is_thin = rect.height <= max_line_height
+        is_horizontal = rect.width > rect.height * 3
+        is_red_color = is_red(color)
+
+        if not (is_thin and is_horizontal and is_red_color):
+            continue
+
+        # Extra guard: confirm the line crosses the middle of a word (not below it)
+        line_mid_y = (rect.y0 + rect.y1) / 2
+        crosses_midpoint = any(
+            w[1] < line_mid_y < w[3]   # line_mid_y falls inside word's y-range
+            for w in words
+            if fitz.Rect(w[:4]).intersects(fitz.Rect(rect.x0, rect.y0 - 8, rect.x1, rect.y1 + 8))
+        )
+
+        if crosses_midpoint:
+            struck_rects.append(rect)
+
+    return struck_rects
