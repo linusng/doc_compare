@@ -154,3 +154,86 @@ def get_strikethrough_rects(page, max_line_height=3.0):
             struck_rects.append(rect)
 
     return struck_rects
+
+
+import fitz
+
+def is_red(color):
+    if not color or len(color) != 3:
+        return False
+    r, g, b = color
+    return r > 0.5 and g < 0.4 and b < 0.4
+
+def get_strikethrough_rects(page, max_line_height=3.0):
+    struck_rects = []
+    words = page.get_text("words")
+
+    for d in page.get_drawings():
+        rect = d["rect"]
+        color = d.get("color") or d.get("fill")
+
+        is_thin = rect.height <= max_line_height
+        is_horizontal = rect.width > rect.height * 3
+        is_red_color = is_red(color)
+
+        if not (is_thin and is_horizontal and is_red_color):
+            continue
+
+        # Confirm line crosses vertical midpoint of a nearby word (not an underline)
+        line_mid_y = (rect.y0 + rect.y1) / 2
+        crosses_midpoint = any(
+            w[1] < line_mid_y < w[3]
+            for w in words
+            if fitz.Rect(w[:4]).intersects(rect)  # no padding — exact horizontal overlap only
+        )
+
+        if crosses_midpoint:
+            struck_rects.append(rect)
+
+    return struck_rects
+
+
+def extract_text_no_strikeout(pdf_path):
+    doc = fitz.open(pdf_path)
+    result = []
+
+    for page in doc:
+        struck_rects = get_strikethrough_rects(page)
+
+        # Use rawdict for char-level bounding boxes
+        blocks = page.get_text("rawdict")["blocks"]
+        clean_chars = []
+        current_line_chars = []
+        last_line_y = None
+
+        for block in blocks:
+            if block["type"] != 0:  # skip non-text blocks
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    for char in span["chars"]:
+                        char_rect = fitz.Rect(char["bbox"])
+                        char_mid_y = (char_rect.y0 + char_rect.y1) / 2
+
+                        is_struck = any(
+                            # Horizontal overlap: char must be under the struck rect x-range
+                            char_rect.x0 < sr.x1 and char_rect.x1 > sr.x0
+                            # Vertical: struck line must cross the char's vertical midpoint
+                            and sr.y0 - 2 < char_mid_y < sr.y1 + 2
+                            for sr in struck_rects
+                        )
+
+                        if not is_struck:
+                            # Track line breaks by y-position
+                            line_y = round(char_rect.y0, 1)
+                            if last_line_y is not None and abs(line_y - last_line_y) > 2:
+                                clean_chars.append("\n")
+                            last_line_y = line_y
+                            clean_chars.append(char["c"])
+
+        result.append("".join(clean_chars))
+
+    return "\n\n".join(result)
+
+
+print(extract_text_no_strikeout("your.pdf"))
