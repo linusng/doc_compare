@@ -237,3 +237,121 @@ def extract_text_no_strikeout(pdf_path):
 
 
 print(extract_text_no_strikeout("your.pdf"))
+
+
+
+import fitz
+
+def is_red(color):
+    if not color or len(color) != 3:
+        return False
+    r, g, b = color
+    return r > 0.5 and g < 0.4 and b < 0.4
+
+def get_strikethrough_rects(page, max_line_height=3.0):
+    """Detect red horizontal strikethrough lines drawn in the content stream."""
+    struck_rects = []
+    words = page.get_text("words")
+
+    for d in page.get_drawings():
+        rect = d["rect"]
+        color = d.get("color") or d.get("fill")
+
+        is_thin = rect.height <= max_line_height
+        is_horizontal = rect.width > rect.height * 3
+        is_red_color = is_red(color)
+
+        if not (is_thin and is_horizontal and is_red_color):
+            continue
+
+        # Confirm line crosses vertical midpoint of a word (strikethrough, not underline)
+        line_mid_y = (rect.y0 + rect.y1) / 2
+        crosses_midpoint = any(
+            w[1] < line_mid_y < w[3]
+            for w in words
+            if fitz.Rect(w[:4]).intersects(rect)
+        )
+
+        if crosses_midpoint:
+            struck_rects.append(rect)
+
+    return struck_rects
+
+
+def build_char_struck_rects(page, struck_rects):
+    """
+    For each strikethrough rect, find the precise bounding box of only
+    the characters underneath it — so redaction doesn't bleed into
+    adjacent text (e.g. blue underlined text right next to struck text).
+    """
+    if not struck_rects:
+        return []
+
+    redact_rects = []
+    blocks = page.get_text("rawdict")["blocks"]
+
+    for sr in struck_rects:
+        chars_in_rect = []
+
+        for block in blocks:
+            if block["type"] != 0:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    for char in span["chars"]:
+                        char_rect = fitz.Rect(char["bbox"])
+                        char_mid_y = (char_rect.y0 + char_rect.y1) / 2
+
+                        horizontal_overlap = char_rect.x0 < sr.x1 and char_rect.x1 > sr.x0
+                        vertical_match = sr.y0 - 2 < char_mid_y < sr.y1 + 2
+
+                        if horizontal_overlap and vertical_match:
+                            chars_in_rect.append(char_rect)
+
+        if chars_in_rect:
+            # Build a tight rect around only the struck characters
+            x0 = min(c.x0 for c in chars_in_rect)
+            y0 = min(c.y0 for c in chars_in_rect)
+            x1 = max(c.x1 for c in chars_in_rect)
+            y1 = max(c.y1 for c in chars_in_rect)
+            redact_rects.append(fitz.Rect(x0, y0, x1, y1))
+
+    return redact_rects
+
+
+def remove_strikeouts_to_pdf(input_path, output_path):
+    """
+    Write a new PDF with red strikethrough text physically removed,
+    preserving all other content including page numbers, layout,
+    images, and blue underlined text.
+    """
+    doc = fitz.open(input_path)
+
+    for page in doc:
+        struck_rects = get_strikethrough_rects(page)
+
+        if not struck_rects:
+            continue
+
+        # Get precise character-level rects to redact
+        redact_rects = build_char_struck_rects(page, struck_rects)
+
+        # Also add the strikethrough lines themselves to the redaction
+        redact_rects.extend(struck_rects)
+
+        # Apply redactions — white fill so it blends with background
+        for rect in redact_rects:
+            page.add_redact_annot(rect, fill=(1, 1, 1))  # white
+
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,  # don't touch images
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE  # don't touch drawings (preserves blue underlines)
+        )
+
+    doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
+    print(f"Saved cleaned PDF to: {output_path}")
+
+
+# Usage
+remove_strikeouts_to_pdf("input.pdf", "output_cleaned.pdf")
