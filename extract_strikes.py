@@ -355,3 +355,135 @@ def remove_strikeouts_to_pdf(input_path, output_path):
 
 # Usage
 remove_strikeouts_to_pdf("input.pdf", "output_cleaned.pdf")
+
+
+
+import fitz
+
+def is_red(color):
+    if not color or len(color) != 3:
+        return False
+    r, g, b = color
+    return r > 0.5 and g < 0.4 and b < 0.4
+
+def is_red_text(color):
+    """Check span color — red text belongs to strikethrough, black/blue does not."""
+    if not color or len(color) != 3:
+        return False
+    r, g, b = color
+    return r > 0.5 and g < 0.4 and b < 0.4
+
+def get_strikethrough_rects(page, max_line_height=3.0):
+    struck_rects = []
+    words = page.get_text("words")
+
+    for d in page.get_drawings():
+        rect = d["rect"]
+        color = d.get("color") or d.get("fill")
+
+        is_thin = rect.height <= max_line_height
+        is_horizontal = rect.width > rect.height * 3
+        is_red_color = is_red(color)
+
+        if not (is_thin and is_horizontal and is_red_color):
+            continue
+
+        line_mid_y = (rect.y0 + rect.y1) / 2
+        crosses_midpoint = any(
+            w[1] < line_mid_y < w[3]
+            for w in words
+            if fitz.Rect(w[:4]).intersects(rect)
+        )
+
+        if crosses_midpoint:
+            struck_rects.append(rect)
+
+    return struck_rects
+
+
+def build_char_struck_rects(page, struck_rects):
+    """
+    A character is struck only if ALL three conditions are true:
+      1. Horizontally under the red line rect
+      2. Vertical midpoint matches the red line's midpoint (within font tolerance)
+      3. The span's text color is RED — black and blue chars are never struck
+    """
+    if not struck_rects:
+        return []
+
+    redact_rects = []
+    blocks = page.get_text("rawdict")["blocks"]
+
+    for sr in struck_rects:
+        struck_chars = []
+        line_mid_y = (sr.y0 + sr.y1) / 2
+
+        for block in blocks:
+            if block["type"] != 0:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    font_size = span["size"]
+                    span_color_int = span.get("color", 0)
+
+                    # Convert integer color to (r, g, b) floats — PyMuPDF stores
+                    # span color as a packed integer e.g. 0xFF0000 for red
+                    r = ((span_color_int >> 16) & 0xFF) / 255.0
+                    g = ((span_color_int >> 8) & 0xFF) / 255.0
+                    b = (span_color_int & 0xFF) / 255.0
+                    span_is_red = is_red_text((r, g, b))
+
+                    # Skip non-red spans entirely — black "$" and blue "S","500" are safe
+                    if not span_is_red:
+                        continue
+
+                    for char in span["chars"]:
+                        char_rect = fitz.Rect(char["bbox"])
+                        char_mid_y = (char_rect.y0 + char_rect.y1) / 2
+
+                        horizontal_overlap = char_rect.x0 < sr.x1 and char_rect.x1 > sr.x0
+                        vertical_match = abs(char_mid_y - line_mid_y) < font_size * 0.6
+
+                        if horizontal_overlap and vertical_match:
+                            struck_chars.append((char_rect, font_size))
+
+        if not struck_chars:
+            continue
+
+        x0 = min(c[0].x0 for c in struck_chars)
+        x1 = max(c[0].x1 for c in struck_chars)
+        avg_font = sum(c[1] for c in struck_chars) / len(struck_chars)
+        y0 = line_mid_y - avg_font * 0.85
+        y1 = line_mid_y + avg_font * 0.45
+
+        redact_rects.append(fitz.Rect(x0, y0, x1, y1))
+
+    return redact_rects
+
+
+def remove_strikeouts_to_pdf(input_path, output_path):
+    doc = fitz.open(input_path)
+
+    for page in doc:
+        struck_rects = get_strikethrough_rects(page)
+
+        if not struck_rects:
+            continue
+
+        redact_rects = build_char_struck_rects(page, struck_rects)
+        redact_rects.extend(struck_rects)  # also erase the red lines themselves
+
+        for rect in redact_rects:
+            page.add_redact_annot(rect, fill=(1, 1, 1))
+
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_NONE,
+            graphics=fitz.PDF_REDACT_LINE_ART_NONE  # preserves blue underline strokes
+        )
+
+    doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
+    print(f"Saved cleaned PDF to: {output_path}")
+
+
+remove_strikeouts_to_pdf("input.pdf", "output_cleaned.pdf")
