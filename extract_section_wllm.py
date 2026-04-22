@@ -43,21 +43,50 @@ from extract_multilingual_wllm import (
 def retrieve_candidates(
     vector_store: InMemoryVectorStore,
     section_query: str,
-    top_k: int = 5,
+    chunks: list,
+    top_k: int = 8,
 ) -> list[tuple[Document, float]]:
     """
-    Search the vector store using the caller-supplied query string.
-    Returns (doc, best_similarity_score) tuples deduplicated and sorted
-    by score descending.
+    Hybrid search: semantic similarity across multiple query angles PLUS
+    a direct keyword match on chunk headings.
+
+    The keyword pass guarantees the actual target section is always a
+    candidate even when generic terms (e.g. "The Facility") score lower
+    in embedding space than body text that merely mentions those words.
     """
     seen: dict[int, tuple[Document, float]] = {}
 
-    for query in [section_query]:
+    # Multiple query angles improve recall for short or generic queries.
+    queries = [
+        section_query,
+        f"Section {section_query}",
+        f"{section_query} clause provisions",
+    ]
+    for query in queries:
         results = vector_store.similarity_search_with_score(query, k=top_k)
         for doc, score in results:
             chunk_id = doc.metadata["chunk_id"]
             if chunk_id not in seen or score > seen[chunk_id][1]:
                 seen[chunk_id] = (doc, score)
+
+    # Keyword pass: any chunk whose heading contains the query text gets
+    # a perfect score so it always appears at the top of the candidate list,
+    # regardless of how the embeddings ranked it.
+    query_lower = section_query.lower()
+    for chunk in chunks:
+        if query_lower in chunk.heading.lower() and chunk.chunk_id not in seen:
+            doc = Document(
+                page_content=chunk.full_text,
+                metadata={
+                    "chunk_id": chunk.chunk_id,
+                    "heading": chunk.heading,
+                    "pages": chunk.pages,
+                    "start_page": chunk.start_page,
+                    "content_length": len(chunk.content),
+                    "heading_level": chunk.heading_level,
+                },
+            )
+            seen[chunk.chunk_id] = (doc, 1.0)
 
     return sorted(seen.values(), key=lambda x: -x[1])
 
@@ -213,7 +242,7 @@ def extract_section(
     )
 
     print(f"[6/7] Retrieving & ranking candidates for: '{section_query}'...")
-    candidates = retrieve_candidates(vector_store, section_query)
+    candidates = retrieve_candidates(vector_store, section_query, chunks)
     print(f"      → {len(candidates)} unique candidates from semantic search")
     best = pick_best_with_llm(
         candidates,
