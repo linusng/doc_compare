@@ -317,6 +317,111 @@ def split_oversized_chunks(
 
     return result
 
+
+
+
+def retrieve_definitions_section(
+    vector_store: InMemoryVectorStore,
+    top_k: int = 10,                        # increase to cast a wider net
+) -> list[Document]:
+    seen: dict[int, Document] = {}
+
+    for query in DEFINITIONS_QUERIES:
+        results = vector_store.similarity_search(query, k=top_k)
+        for doc in results:
+            chunk_id = doc.metadata["chunk_id"]
+            if chunk_id not in seen:
+                seen[chunk_id] = doc
+
+    return sorted(seen.values(), key=lambda d: d.metadata["start_page"])
+
+
+def pick_best_section(
+    candidates: list[Document],
+    all_chunks: list[SectionChunk],
+) -> ExtractionResult:
+    """
+    1. Find the single best anchor chunk (the heading match).
+    2. Walk forward through all_chunks from that anchor, collecting
+       consecutive chunks that belong to the same section — i.e. sub-sections
+       like 1.1, 1.2 … or continuation parts — until a new top-level
+       section heading is encountered.
+    3. Stitch all collected chunks into one ExtractionResult.
+    """
+
+    # ── Step 1: score candidates to find the anchor ───────────────────────
+    scored: list[tuple[float, Document]] = []
+
+    for doc in candidates:
+        heading = doc.metadata.get("heading", "")
+        content_length = doc.metadata.get("content_length", len(doc.page_content))
+        score = 0.0
+
+        if re.search(r'^\d+[\.\d]*', heading.strip()):
+            score += 2.0
+        score += min(content_length / 500, 3.0)
+        if content_length < 100:
+            score -= 2.0
+
+        scored.append((score, doc))
+
+    scored.sort(key=lambda x: -x[0])
+    anchor = scored[0][1]
+    anchor_id = anchor.metadata["chunk_id"]
+
+    # ── Step 2: detect the top-level section number of the anchor ─────────
+    anchor_heading = anchor.metadata.get("heading", "")
+    # e.g. "1.1 Definitions..." → top-level section = "1"
+    top_level_match = re.match(r'^(\d+)[\.\s]', anchor_heading.strip())
+    top_level_prefix = top_level_match.group(1) + "." if top_level_match else None
+
+    # ── Step 3: walk forward from anchor, collecting sibling chunks ───────
+    collected: list[SectionChunk] = []
+    collecting = False
+
+    for chunk in all_chunks:
+        if chunk.chunk_id == anchor_id:
+            collecting = True
+
+        if not collecting:
+            continue
+
+        heading = chunk.heading.strip()
+
+        if chunk.chunk_id != anchor_id:
+            # Stop when we hit a NEW top-level section
+            # e.g. stop at "2." or "2.1" but continue through "1.1", "1.2"
+            new_top = re.match(r'^(\d+)[\.\s]', heading)
+            if new_top:
+                new_prefix = new_top.group(1) + "."
+                if top_level_prefix and new_prefix != top_level_prefix:
+                    break
+            # Also stop on non-numbered bold headings that signal a new section
+            elif heading and not heading.startswith("("):
+                # Heuristic: short bold-style line with no parent prefix = new section
+                if len(heading) < 80 and chunk.chunk_id > anchor_id + 1:
+                    break
+
+        collected.append(chunk)
+
+    # ── Step 4: stitch collected chunks into one result ───────────────────
+    all_pages = sorted({p for chunk in collected for p in chunk.pages})
+    full_content = "\n\n".join(chunk.full_text for chunk in collected)
+
+    return ExtractionResult(
+        heading=anchor_heading,
+        content=full_content,
+        pages=all_pages,
+        chunk_id=anchor_id,
+    )
+
+
+
+
+
+
+
+
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 
 def extract_definitions_section(
@@ -333,7 +438,8 @@ def extract_definitions_section(
     chunks = split_oversized_chunks(chunks)   # ← add this line
     vector_store = build_vector_store(chunks)
     candidates = retrieve_definitions_section(vector_store)
-    best = pick_best_section(candidates)
+    # best = pick_best_section(candidates)
+    result = pick_best_section(candidates, all_chunks=chunks)  # ← pass chunks
 
     result = ExtractionResult(
         heading=best.metadata["heading"],
