@@ -585,8 +585,12 @@ def gather_full_section(
             collected.append(chunk)
             continue
 
-        # Has a section number that differs from ours → sibling or
-        # parent's next child.  Stop.
+        # True child (e.g. 1.1, 1.2 when best_num is "1") → include
+        if _is_child_section(best_num, chunk.heading):
+            collected.append(chunk)
+            continue
+
+        # Sibling or unrelated section → stop
         break
 
     # Walk backward to catch earlier split parts (e.g. best was part 3
