@@ -100,6 +100,73 @@ def extract_structured_blocks(pdf_path: str) -> list:
     return blocks
 
 
+# ── Phase 1b: TOC Page Detection & Filtering ─────────────────────────────────
+
+# TOC line pattern: optional section number, some text, then dot leaders
+# and/or a trailing page number.  Language-agnostic — matches structural
+# shape, not words.
+#   "1.1  Definitions .............. 5"
+#   "Anhang A  Begriffsbestimmungen   12"
+#   "第一条  定义 .................. 3"
+_TOC_LINE_RE = re.compile(
+    r'^\s*'                      # leading whitespace
+    r'(?:\d+[\.\d]*\s+)?'        # optional section number
+    r'.{2,80}'                   # some heading text (2-80 chars)
+    r'(?:\s*\.{3,}\s*|\s{3,})'   # dot leaders OR wide whitespace gap
+    r'\d{1,4}'                   # trailing page number
+    r'\s*$'                      # end of line
+)
+
+
+def detect_toc_pages(blocks: list[TextBlock]) -> set[int]:
+    """
+    Identify pages that are part of a Table of Contents.
+
+    Heuristic (language-agnostic, purely structural):
+      A page is a TOC page if a high proportion of its non-empty lines
+      match the TOC-line pattern (section number + text + dot leader /
+      whitespace gap + page number).
+
+    Returns the set of page numbers to exclude.
+    """
+    # Group blocks by page
+    pages: dict[int, list[TextBlock]] = {}
+    for b in blocks:
+        pages.setdefault(b.page, []).append(b)
+
+    toc_pages = set()
+
+    for page_num, page_blocks in pages.items():
+        # Flatten all text on this page into individual lines
+        all_lines = []
+        for b in page_blocks:
+            for line in b.text.split("\n"):
+                stripped = line.strip()
+                if stripped:
+                    all_lines.append(stripped)
+
+        if len(all_lines) < 3:
+            continue
+
+        toc_line_count = sum(1 for ln in all_lines if _TOC_LINE_RE.match(ln))
+        ratio = toc_line_count / len(all_lines)
+
+        # If more than 40% of non-empty lines look like TOC entries,
+        # flag this page.  Real content pages rarely have this pattern.
+        if ratio >= 0.40 and toc_line_count >= 3:
+            toc_pages.add(page_num)
+
+    return toc_pages
+
+
+def filter_toc_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
+    """Remove all blocks that belong to detected TOC pages."""
+    toc_pages = detect_toc_pages(blocks)
+    if toc_pages:
+        print(f"      → TOC detected on page(s): {sorted(toc_pages)}, excluding")
+    return [b for b in blocks if b.page not in toc_pages]
+
+
 # ── Phase 2: Heading Detection & Section Chunking ────────────────────────────
 
 def _get_heading_level(text: str) -> int:
@@ -574,23 +641,27 @@ def extract_definitions_section(
 ) -> ExtractionResult:
     """
     Full pipeline:
-      PDF → structured blocks → section chunks → token-safe splits
-          → BGE-M3 embeddings → semantic retrieval → LLM ranking
-          → gather full section → merge → ExtractionResult
+      PDF → structured blocks → filter TOC pages → section chunks
+          → token-safe splits → BGE-M3 embeddings → semantic retrieval
+          → LLM ranking → gather full section → merge → ExtractionResult
     """
-    print(f"[1/6] Extracting blocks from: {pdf_path}")
+    print(f"[1/7] Extracting blocks from: {pdf_path}")
     blocks = extract_structured_blocks(pdf_path)
     print(f"      → {len(blocks)} blocks extracted")
 
-    print("[2/6] Chunking by section...")
+    print("[2/7] Filtering TOC pages...")
+    blocks = filter_toc_blocks(blocks)
+    print(f"      → {len(blocks)} blocks after TOC filtering")
+
+    print("[3/7] Chunking by section...")
     chunks = chunk_by_section(blocks)
     print(f"      → {len(chunks)} sections found")
 
-    print("[3/6] Splitting oversized chunks...")
+    print("[4/7] Splitting oversized chunks...")
     chunks = split_oversized_chunks(chunks)
     print(f"      → {len(chunks)} chunks after token-safe split")
 
-    print("[4/6] Building vector store...")
+    print("[5/7] Building vector store...")
     vector_store = build_vector_store(
         chunks,
         base_url=ollama_base_url,
@@ -598,7 +669,7 @@ def extract_definitions_section(
         model=embedding_model,
     )
 
-    print("[5/6] Retrieving & ranking candidates...")
+    print("[6/7] Retrieving & ranking candidates...")
     candidates = retrieve_candidates(vector_store)
     print(f"      → {len(candidates)} unique candidates from semantic search")
     best = pick_best_with_llm(
@@ -609,7 +680,7 @@ def extract_definitions_section(
     )
     print(f"      → LLM selected: {best.metadata.get('heading', '?')}")
 
-    print("[6/6] Gathering full section...")
+    print("[7/7] Gathering full section...")
     section_chunks = gather_full_section(best, chunks)
     print(f"      → {len(section_chunks)} chunks in full section")
     result = merge_section_chunks(section_chunks)
@@ -647,4 +718,4 @@ if __name__ == "__main__":
     print(f"Pages    : {result.pages}")
     print(f"Chunks   : gathered into single result")
     print(f"Verified : {result.verified}")
-    print(f"\n{result.content}")
+    print(f"\n{result.content[:800]}")
