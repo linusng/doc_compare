@@ -150,19 +150,25 @@ def detect_toc_pages(
         ("system", (
             "You are a document structure analyst. You will be shown the "
             "text content of several pages from a legal document.\n\n"
-            "Your task is to identify which pages are part of a Table of "
-            "Contents (TOC). TOC pages typically contain:\n"
-            "- Lists of section numbers and titles\n"
-            "- Page number references\n"
+            "Your task is to identify which pages are a Table of Contents "
+            "(TOC). A TOC page contains ONLY:\n"
+            "- Lists of section numbers and titles with page number references\n"
             "- Dot leaders or spacing between titles and page numbers\n"
-            "- Dense listings of section headings without substantive body text\n\n"
+            "- Dense listings of headings with NO substantive body text\n\n"
+            "A TOC is NOT:\n"
+            "- A cover page, title page, or signature page\n"
+            "- A page with actual clause or contract body text\n"
+            "- A page that merely starts with a section heading\n\n"
             "Note: The text extraction may be messy — section titles and page "
             "numbers may run together without spaces (e.g. "
             "'1.DEFINITIONS AND INTERPRETATION2 2.THE FACILITY13'). "
             "This is still a TOC.\n\n"
+            "Be conservative — only include a page if you are CERTAIN it is "
+            "a TOC page. When in doubt, exclude it.\n\n"
             "Respond with ONLY a comma-separated list of page numbers that "
-            "are TOC pages. If no pages are TOC pages, respond with: NONE\n\n"
-            "Example response: 2,3,4"
+            "are TOC pages, using the exact PAGE numbers shown in the input. "
+            "If no pages are TOC pages, respond with: NONE\n\n"
+            "Example response: 2,3"
         )),
         ("human", "{pages}"),
     ])
@@ -174,15 +180,32 @@ def detect_toc_pages(
     if answer.upper() == "NONE":
         return set()
 
-    # Parse comma-separated page numbers
+    # Only accept page numbers from the pages we actually showed the LLM.
+    # Validating against the full `pages` dict would allow the LLM to name
+    # pages it never saw, incorrectly filtering real content pages.
+    shown_pages = set(pages_to_check)
     toc_pages = set()
     for token in answer.replace(" ", "").split(","):
         try:
             page_num = int(token)
-            if page_num in pages:
+            if page_num in shown_pages:
                 toc_pages.add(page_num)
         except ValueError:
             continue
+
+    # Sanity check: TOC pages in legal documents are always a small,
+    # consecutive block at the very start. If the result looks wrong,
+    # discard it entirely rather than corrupting the extraction.
+    MAX_TOC_PAGES = 5
+    if len(toc_pages) > MAX_TOC_PAGES:
+        return set()
+
+    if len(toc_pages) > 1:
+        sorted_toc = sorted(toc_pages)
+        span = sorted_toc[-1] - sorted_toc[0]
+        if span > MAX_TOC_PAGES:
+            # Pages are non-consecutive / scattered — almost certainly wrong
+            return set()
 
     return toc_pages
 
