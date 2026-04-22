@@ -544,6 +544,40 @@ def _is_child_section(parent_num: str, candidate_heading: str) -> bool:
     return cand_num.startswith(parent_num + ".")
 
 
+# Recognised named structural prefixes (case-insensitive).
+_NAMED_PREFIX_RE = re.compile(
+    r'^(schedule|annex|appendix|exhibit|attachment|part)\s+(\w+)',
+    re.IGNORECASE,
+)
+
+
+def _extract_named_prefix(heading: str) -> tuple[str, str] | None:
+    """
+    For headings like 'Schedule 2 Compounded Rate Terms' or 'Annex A Definitions',
+    return (prefix_word, identifier) e.g. ('schedule', '2') or ('annex', 'a').
+    Returns None if the heading doesn't follow this pattern.
+    """
+    m = _NAMED_PREFIX_RE.match(_base_heading(heading).strip())
+    if m:
+        return (m.group(1).lower(), m.group(2).lower())
+    return None
+
+
+def _is_sibling_named_section(best_heading: str, candidate_heading: str) -> bool:
+    """
+    Return True when candidate_heading is a peer of best_heading under the
+    same named-section type but a different identifier.
+    E.g. best='Schedule 2 ...' and candidate='Schedule 3 ...' → True.
+         best='Schedule 2 ...' and candidate='Part 1 ...'      → False.
+    """
+    best_prefix = _extract_named_prefix(best_heading)
+    cand_prefix = _extract_named_prefix(candidate_heading)
+    if best_prefix is None or cand_prefix is None:
+        return False
+    # Same structural type (e.g. both "schedule"), different identifier
+    return best_prefix[0] == cand_prefix[0] and best_prefix[1] != cand_prefix[1]
+
+
 def gather_full_section(
     best_doc: Document,
     all_chunks: list[SectionChunk],
@@ -579,12 +613,38 @@ def gather_full_section(
     if start_idx is None:
         return [c for c in all_chunks if c.chunk_id == best_id]
 
-    # If no section number, fall back to same-base-heading matching
+    # If no leading digit section number, check for named structural sections
+    # (Schedule N, Annex A, Appendix 3, etc.) and walk forward until the next
+    # sibling.  Fall back to same-base-heading-only if no pattern is recognised.
     if best_num is None:
-        return [
-            c for c in all_chunks
-            if _base_heading(c.heading) == best_base
-        ]
+        if _extract_named_prefix(best_heading) is None:
+            # Truly unstructured heading — only return split parts of this chunk.
+            return [
+                c for c in all_chunks
+                if _base_heading(c.heading) == best_base
+            ]
+
+        # Named structural section: collect everything forward until the next
+        # sibling (e.g. "Schedule 3" stops collection started at "Schedule 2").
+        collected = []
+        for i in range(start_idx, len(all_chunks)):
+            chunk = all_chunks[i]
+            if i == start_idx:
+                collected.append(chunk)
+                continue
+            if _is_sibling_named_section(best_heading, chunk.heading):
+                break
+            collected.append(chunk)
+
+        # Walk backward to pick up earlier split parts of the same heading.
+        for i in range(start_idx - 1, -1, -1):
+            chunk = all_chunks[i]
+            if _base_heading(chunk.heading) == best_base:
+                collected.insert(0, chunk)
+            else:
+                break
+
+        return collected
 
     # Walk forward from start_idx
     collected = []
