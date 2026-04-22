@@ -102,68 +102,108 @@ def extract_structured_blocks(pdf_path: str) -> list:
 
 # ── Phase 1b: TOC Page Detection & Filtering ─────────────────────────────────
 
-# TOC line pattern: optional section number, some text, then dot leaders
-# and/or a trailing page number.  Language-agnostic — matches structural
-# shape, not words.
-#   "1.1  Definitions .............. 5"
-#   "Anhang A  Begriffsbestimmungen   12"
-#   "第一条  定义 .................. 3"
-_TOC_LINE_RE = re.compile(
-    r'^\s*'                      # leading whitespace
-    r'(?:\d+[\.\d]*\s+)?'        # optional section number
-    r'.{2,80}'                   # some heading text (2-80 chars)
-    r'(?:\s*\.{3,}\s*|\s{3,})'   # dot leaders OR wide whitespace gap
-    r'\d{1,4}'                   # trailing page number
-    r'\s*$'                      # end of line
-)
-
-
-def detect_toc_pages(blocks: list[TextBlock]) -> set[int]:
+def detect_toc_pages(
+    blocks: list[TextBlock],
+    llm_model: str = "gemma3-27b-it",
+    base_url: str = "http://localhost:11434/v1",
+    api_key: str = "ollama",
+    max_pages_to_check: int = 15,
+) -> set[int]:
     """
-    Identify pages that are part of a Table of Contents.
+    Use an LLM to identify Table of Contents pages.
 
-    Heuristic (language-agnostic, purely structural):
-      A page is a TOC page if a high proportion of its non-empty lines
-      match the TOC-line pattern (section number + text + dot leader /
-      whitespace gap + page number).
+    Groups blocks by page, extracts raw text for the first N pages
+    (TOCs are always near the front), and asks the LLM to classify
+    each page as TOC or not in a single batched call.
 
-    Returns the set of page numbers to exclude.
+    Fully language-agnostic — the LLM reads the actual page content
+    and decides based on layout and meaning, not regex.
     """
     # Group blocks by page
     pages: dict[int, list[TextBlock]] = {}
     for b in blocks:
         pages.setdefault(b.page, []).append(b)
 
+    # Only check the first N pages — TOCs don't appear mid-document
+    pages_to_check = sorted(pages.keys())[:max_pages_to_check]
+
+    if not pages_to_check:
+        return set()
+
+    # Build page previews (truncate each to ~500 chars to keep prompt small)
+    page_previews = []
+    for page_num in pages_to_check:
+        page_text = "\n".join(b.text for b in pages[page_num])
+        preview = page_text[:500]
+        page_previews.append(f"--- PAGE {page_num} ---\n{preview}")
+
+    pages_text = "\n\n".join(page_previews)
+
+    llm = ChatOpenAI(
+        model=llm_model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=0,
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are a document structure analyst. You will be shown the "
+            "text content of several pages from a legal document.\n\n"
+            "Your task is to identify which pages are part of a Table of "
+            "Contents (TOC). TOC pages typically contain:\n"
+            "- Lists of section numbers and titles\n"
+            "- Page number references\n"
+            "- Dot leaders or spacing between titles and page numbers\n"
+            "- Dense listings of section headings without substantive body text\n\n"
+            "Note: The text extraction may be messy — section titles and page "
+            "numbers may run together without spaces (e.g. "
+            "'1.DEFINITIONS AND INTERPRETATION2 2.THE FACILITY13'). "
+            "This is still a TOC.\n\n"
+            "Respond with ONLY a comma-separated list of page numbers that "
+            "are TOC pages. If no pages are TOC pages, respond with: NONE\n\n"
+            "Example response: 2,3,4"
+        )),
+        ("human", "{pages}"),
+    ])
+
+    chain = prompt | llm
+    result = chain.invoke({"pages": pages_text})
+    answer = result.content.strip()
+
+    if answer.upper() == "NONE":
+        return set()
+
+    # Parse comma-separated page numbers
     toc_pages = set()
-
-    for page_num, page_blocks in pages.items():
-        # Flatten all text on this page into individual lines
-        all_lines = []
-        for b in page_blocks:
-            for line in b.text.split("\n"):
-                stripped = line.strip()
-                if stripped:
-                    all_lines.append(stripped)
-
-        if len(all_lines) < 3:
+    for token in answer.replace(" ", "").split(","):
+        try:
+            page_num = int(token)
+            if page_num in pages:
+                toc_pages.add(page_num)
+        except ValueError:
             continue
-
-        toc_line_count = sum(1 for ln in all_lines if _TOC_LINE_RE.match(ln))
-        ratio = toc_line_count / len(all_lines)
-
-        # If more than 40% of non-empty lines look like TOC entries,
-        # flag this page.  Real content pages rarely have this pattern.
-        if ratio >= 0.40 and toc_line_count >= 3:
-            toc_pages.add(page_num)
 
     return toc_pages
 
 
-def filter_toc_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
+def filter_toc_blocks(
+    blocks: list[TextBlock],
+    llm_model: str = "gemma3-27b-it",
+    base_url: str = "http://localhost:11434/v1",
+    api_key: str = "ollama",
+) -> list[TextBlock]:
     """Remove all blocks that belong to detected TOC pages."""
-    toc_pages = detect_toc_pages(blocks)
+    toc_pages = detect_toc_pages(
+        blocks,
+        llm_model=llm_model,
+        base_url=base_url,
+        api_key=api_key,
+    )
     if toc_pages:
         print(f"      → TOC detected on page(s): {sorted(toc_pages)}, excluding")
+    else:
+        print("      → No TOC pages detected")
     return [b for b in blocks if b.page not in toc_pages]
 
 
@@ -650,7 +690,12 @@ def extract_definitions_section(
     print(f"      → {len(blocks)} blocks extracted")
 
     print("[2/7] Filtering TOC pages...")
-    blocks = filter_toc_blocks(blocks)
+    blocks = filter_toc_blocks(
+        blocks,
+        llm_model=llm_model,
+        base_url=ollama_base_url,
+        api_key=ollama_api_key,
+    )
     print(f"      → {len(blocks)} blocks after TOC filtering")
 
     print("[3/7] Chunking by section...")
