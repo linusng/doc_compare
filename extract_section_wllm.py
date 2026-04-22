@@ -34,6 +34,7 @@ from extract_multilingual_wllm import (
     filter_toc_blocks,
     gather_full_section,
     merge_section_chunks,
+    pydantic_copy,
     split_oversized_chunks,
 )
 
@@ -60,16 +61,16 @@ def select_heading_with_llm(
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
-) -> Document | None:
+    top_n: int = 3,
+) -> list[Document]:
     """
-    Present every unique section heading to the LLM and ask which one
-    best matches section_query.  Operating on headings alone — not
-    content previews — prevents body text that merely mentions the
-    query terms from being selected.
+    Present every unique section heading to the LLM and ask it to rank
+    up to top_n matches for section_query, best first.
 
-    Returns the corresponding Document, or None if the LLM cannot match.
+    Returns a list of Documents in ranked order (may be empty if the LLM
+    finds no matches).  Returning multiple candidates lets the caller retry
+    with lower-ranked options when verification fails.
     """
-    # Deduplicate by base heading so split parts don't flood the list.
     seen_bases: dict[str, object] = {}
     for chunk in chunks:
         base = _base_heading(chunk.heading)
@@ -78,7 +79,7 @@ def select_heading_with_llm(
 
     unique_chunks = list(seen_bases.values())
     if not unique_chunks:
-        return None
+        return []
 
     heading_lines = [
         f"[{i}] {_base_heading(c.heading)}"
@@ -96,14 +97,15 @@ def select_heading_with_llm(
     prompt = ChatPromptTemplate.from_messages([
         ("system", (
             "You are given a numbered list of section headings from a legal "
-            "document. Identify which heading best matches the following "
+            "document. Identify which headings best match the following "
             f"section description:\n\n  \"{section_query}\"\n\n"
             "Rules:\n"
             "- Match by heading text only — ignore body content.\n"
             "- The section number in the query is a hint; if the title "
             "matches but the number differs slightly, still select it.\n"
-            "- If multiple headings match, pick the most specific one.\n\n"
-            "Respond with ONLY the number in square brackets, e.g.: 5\n"
+            f"- Return up to {top_n} matches ranked best first.\n\n"
+            "Respond with ONLY a comma-separated list of numbers, best first, "
+            f"e.g.: 5,2,8\n"
             "If no heading matches, respond with: NONE"
         )),
         ("human", "{headings}"),
@@ -113,15 +115,19 @@ def select_heading_with_llm(
     answer = result.content.strip()
 
     if answer.upper() == "NONE":
-        return None
+        return []
 
-    m = re.search(r'\d+', answer)
-    if m:
+    docs = []
+    seen_ids: set[int] = set()
+    for m in re.finditer(r'\d+', answer):
         idx = int(m.group())
-        if 0 <= idx < len(unique_chunks):
-            return _chunk_to_doc(unique_chunks[idx])
+        if 0 <= idx < len(unique_chunks) and idx not in seen_ids:
+            docs.append(_chunk_to_doc(unique_chunks[idx]))
+            seen_ids.add(idx)
+        if len(docs) >= top_n:
+            break
 
-    return None
+    return docs
 
 
 def retrieve_candidates(
@@ -309,41 +315,60 @@ def extract_section(
     )
 
     print(f"[6/7] Selecting section for: '{section_query}'...")
-    # Primary: LLM selects from heading list only — section-strict, no body
-    # text confusion.  Fallback: hybrid semantic + keyword search when the
-    # heading pass returns nothing (e.g. unnumbered or ambiguous titles).
-    best = select_heading_with_llm(
+    # Build an ordered candidate list: heading-ranked matches first,
+    # then semantic fallbacks.  The retry loop below works through this
+    # list so verification failures automatically try the next candidate.
+    candidate_docs: list[Document] = []
+    seen_ids: set[int] = set()
+
+    heading_candidates = select_heading_with_llm(
         chunks,
         section_query=section_query,
         llm_model=llm_model,
         base_url=ollama_base_url,
         api_key=ollama_api_key,
     )
-    if best is not None:
-        print(f"      → Heading match: {best.metadata.get('heading', '?')}")
+    for doc in heading_candidates:
+        cid = doc.metadata["chunk_id"]
+        if cid not in seen_ids:
+            candidate_docs.append(doc)
+            seen_ids.add(cid)
+
+    if heading_candidates:
+        labels = [d.metadata.get("heading", "?") for d in heading_candidates]
+        print(f"      → Heading candidates: {labels}")
     else:
-        print("      → No heading match; falling back to semantic search...")
-        candidates = retrieve_candidates(vector_store, section_query, chunks)
-        print(f"      → {len(candidates)} candidates from semantic search")
-        best = pick_best_with_llm(
-            candidates,
-            section_query=section_query,
-            llm_model=llm_model,
-            base_url=ollama_base_url,
-            api_key=ollama_api_key,
-        )
-        print(f"      → LLM selected: {best.metadata.get('heading', '?')}")
+        print("      → No heading match; using semantic search only...")
 
-    print("[7/7] Gathering full section...")
-    section_chunks = gather_full_section(best, chunks)
-    print(f"      → {len(section_chunks)} chunks in full section")
-    result = merge_section_chunks(section_chunks)
+    # Always append semantic candidates as additional fallbacks.
+    sem_candidates = retrieve_candidates(vector_store, section_query, chunks)
+    for doc, _ in sem_candidates:
+        cid = doc.metadata["chunk_id"]
+        if cid not in seen_ids:
+            candidate_docs.append(doc)
+            seen_ids.add(cid)
 
-    if verify:
-        print("      Running LLM verification...")
+    if not candidate_docs:
+        raise ValueError(f"No candidates found for query: '{section_query}'")
+
+    print(f"      → {len(candidate_docs)} total candidates to try")
+
+    print("[7/7] Gathering & verifying section...")
+    result = None
+    for attempt, candidate_doc in enumerate(candidate_docs, start=1):
+        heading = candidate_doc.metadata.get("heading", "?")
+        section_chunks = gather_full_section(candidate_doc, chunks)
+        merged = merge_section_chunks(section_chunks)
+
+        if not verify:
+            # No verification requested — take the top candidate immediately.
+            result = merged
+            print(f"      → Selected: {heading}")
+            break
+
         verify_doc = Document(
-            page_content=result.content,
-            metadata={"heading": result.heading, "pages": result.pages},
+            page_content=merged.content,
+            metadata={"heading": merged.heading, "pages": merged.pages},
         )
         confirmed, llm_output = verify_with_llm(
             verify_doc,
@@ -352,11 +377,13 @@ def extract_section(
             base_url=ollama_base_url,
             api_key=ollama_api_key,
         )
-        from extract_multilingual_wllm import pydantic_copy
-        result = pydantic_copy(result, {
-            "verified": confirmed,
-            "llm_output": llm_output,
-        })
+        result = pydantic_copy(merged, {"verified": confirmed, "llm_output": llm_output})
+
+        if confirmed:
+            print(f"      → Verified on attempt {attempt}: {heading}")
+            break
+
+        print(f"      → Attempt {attempt} failed verification ({heading}), trying next...")
 
     return result
 
