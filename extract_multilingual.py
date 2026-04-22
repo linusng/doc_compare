@@ -268,6 +268,54 @@ def verify_with_llm(
     output = result.content.strip()
     return output != "NOT_FOUND", output
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# BGE-M3 max = 8192 tokens. At ~4 chars/token, 8192 * 4 = 32768 chars.
+# Use 0.85 safety margin → 27,500 chars max per chunk.
+BGE_M3_MAX_CHARS = 27_500
+BGE_M3_CHUNK_OVERLAP = 500
+
+
+def split_oversized_chunks(
+    chunks: list[SectionChunk],
+    max_chars: int = BGE_M3_MAX_CHARS,
+    chunk_overlap: int = BGE_M3_CHUNK_OVERLAP,
+) -> list[SectionChunk]:
+    """
+    Any SectionChunk whose full_text exceeds max_chars is split into
+    smaller sub-chunks using RecursiveCharacterTextSplitter.
+    Heading and page metadata are propagated to every sub-chunk.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_chars,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+
+    result: list[SectionChunk] = []
+
+    for chunk in chunks:
+        if len(chunk.full_text) <= max_chars:
+            result.append(chunk)
+            continue
+
+        sub_texts = splitter.split_text(chunk.content)
+
+        for i, sub_text in enumerate(sub_texts):
+            result.append(SectionChunk(
+                heading=f"{chunk.heading} (part {i + 1})",
+                content=sub_text,
+                pages=chunk.pages,
+                start_page=chunk.start_page,
+                chunk_id=0,          # re-assigned in build_vector_store
+            ))
+
+    # Re-assign chunk_ids after potential splits
+    for idx, chunk in enumerate(result):
+        result[idx] = chunk.copy(update={"chunk_id": idx})
+
+    return result
 
 # ── Main Pipeline ─────────────────────────────────────────────────────────────
 
@@ -282,6 +330,7 @@ def extract_definitions_section(
     """
     blocks = extract_structured_blocks(pdf_path)
     chunks = chunk_by_section(blocks)
+    chunks = split_oversized_chunks(chunks)   # ← add this line
     vector_store = build_vector_store(chunks)
     candidates = retrieve_definitions_section(vector_store)
     best = pick_best_section(candidates)
