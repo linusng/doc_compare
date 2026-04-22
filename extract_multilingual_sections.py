@@ -249,15 +249,15 @@ def search_section(
     top_k: int = 3,
 ) -> SectionResult:
     """
-    Given a natural-language section name (e.g. "Definitions", "Purpose"),
-    find the best matching section and return its COMPLETE content by
-    reassembling all sub-chunks that belong to the same parent heading.
+    Given a section name query, finds the best matching section heading
+    and returns ALL content from that heading until the next same-level
+    heading — guaranteeing the entire section is returned.
 
-    Steps:
-      1. Semantic search to find the most relevant chunk.
-      2. Resolve its parent_heading (the true section heading).
-      3. Collect ALL chunks sharing that parent_heading (handles splits).
-      4. Sort by start_page and concatenate into the full section text.
+    Strategy:
+      1. Semantic search to identify the best matching chunk.
+      2. Walk all_chunks from that chunk's position forward.
+      3. Stop only when a new heading of equal/higher level is encountered.
+      4. Concatenate everything in between.
     """
     results = vector_store.similarity_search(query, k=top_k)
 
@@ -270,31 +270,83 @@ def search_section(
             chunk_ids=[],
         )
 
-    # Best hit determines which section we target
-    best_doc = results[0]
-    target_parent_heading = best_doc.metadata["parent_heading"]
+    # ── Step 1: resolve the best matching parent heading ─────────────────────
+    target_parent_heading = results[0].metadata["parent_heading"]
 
-    # Collect ALL chunks belonging to that section (including split parts)
-    section_chunks = [
-        c for c in all_chunks
-        if c.parent_heading == target_parent_heading
-    ]
+    # Find the first chunk in all_chunks whose parent_heading matches
+    start_idx = next(
+        (i for i, c in enumerate(all_chunks)
+         if c.parent_heading == target_parent_heading),
+        None,
+    )
 
-    # Sort by page order to reconstruct reading order
-    section_chunks.sort(key=lambda c: (c.start_page, c.chunk_id))
+    if start_idx is None:
+        return SectionResult(
+            query=query,
+            heading="",
+            content="",
+            pages=[],
+            chunk_ids=[],
+        )
 
-    full_content = "\n\n".join(c.content for c in section_chunks)
-    all_pages = sorted({p for c in section_chunks for p in c.pages})
-    all_chunk_ids = [c.chunk_id for c in section_chunks]
+    # ── Step 2: detect the heading level of the matched section ──────────────
+    matched_heading = all_chunks[start_idx].parent_heading
+    matched_level = _heading_level(matched_heading)
+
+    # ── Step 3: walk forward, collecting chunks until next same/higher heading
+    collected: list[SectionChunk] = []
+    seen_parents: set[str] = set()
+
+    for chunk in all_chunks[start_idx:]:
+        current_level = _heading_level(chunk.parent_heading)
+        is_new_section = (
+            chunk.parent_heading != matched_heading
+            and chunk.parent_heading not in seen_parents
+            and current_level <= matched_level
+        )
+
+        if is_new_section and collected:
+            # We've hit the next sibling/parent section — stop
+            break
+
+        collected.append(chunk)
+        seen_parents.add(chunk.parent_heading)
+
+    # ── Step 4: sort and reassemble ──────────────────────────────────────────
+    collected.sort(key=lambda c: (c.start_page, c.chunk_id))
+
+    full_content = "\n\n".join(c.content for c in collected)
+    all_pages = sorted({p for c in collected for p in c.pages})
+    all_chunk_ids = [c.chunk_id for c in collected]
 
     return SectionResult(
         query=query,
-        heading=target_parent_heading,
+        heading=matched_heading,
         content=full_content,
         pages=all_pages,
         chunk_ids=all_chunk_ids,
     )
 
+
+def _heading_level(heading: str) -> int:
+    """
+    Infer heading depth from its numbering scheme so we know when to stop
+    collecting content.
+
+    Examples:
+      "1."          → level 1
+      "1.1"         → level 2
+      "1.1.1"       → level 3
+      "Definitions" → level 1  (unnumbered headings treated as top-level)
+    """
+    match = re.match(r'^(\d+)(\.(\d+))*(\.)?', heading.strip())
+    if not match:
+        return 1  # unnumbered → treat as top-level
+
+    # Count the dot-separated numeric segments
+    numeric_part = re.match(r'^[\d.]+', heading.strip()).group()
+    segments = [s for s in numeric_part.split(".") if s.isdigit()]
+    return len(segments)
 
 # ── Phase 6: Optional LLM Verification ───────────────────────────────────────
 
