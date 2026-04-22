@@ -38,7 +38,91 @@ from extract_multilingual_wllm import (
 )
 
 
-# ── Phase 5: Generic Semantic Retrieval ───────────────────────────────────────
+# ── Phase 5: Heading-first Section Selection ──────────────────────────────────
+
+def _chunk_to_doc(chunk) -> Document:
+    return Document(
+        page_content=chunk.full_text,
+        metadata={
+            "chunk_id": chunk.chunk_id,
+            "heading": chunk.heading,
+            "pages": chunk.pages,
+            "start_page": chunk.start_page,
+            "content_length": len(chunk.content),
+            "heading_level": chunk.heading_level,
+        },
+    )
+
+
+def select_heading_with_llm(
+    chunks: list,
+    section_query: str,
+    llm_model: str = "gemma3-27b-it",
+    base_url: str = "http://localhost:11434/v1",
+    api_key: str = "ollama",
+) -> Document | None:
+    """
+    Present every unique section heading to the LLM and ask which one
+    best matches section_query.  Operating on headings alone — not
+    content previews — prevents body text that merely mentions the
+    query terms from being selected.
+
+    Returns the corresponding Document, or None if the LLM cannot match.
+    """
+    # Deduplicate by base heading so split parts don't flood the list.
+    seen_bases: dict[str, object] = {}
+    for chunk in chunks:
+        base = _base_heading(chunk.heading)
+        if base and base not in seen_bases:
+            seen_bases[base] = chunk
+
+    unique_chunks = list(seen_bases.values())
+    if not unique_chunks:
+        return None
+
+    heading_lines = [
+        f"[{i}] {_base_heading(c.heading)}"
+        for i, c in enumerate(unique_chunks)
+    ]
+    headings_text = "\n".join(heading_lines)
+
+    llm = ChatOpenAI(
+        model=llm_model,
+        base_url=base_url,
+        api_key=api_key,
+        temperature=0,
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are given a numbered list of section headings from a legal "
+            "document. Identify which heading best matches the following "
+            f"section description:\n\n  \"{section_query}\"\n\n"
+            "Rules:\n"
+            "- Match by heading text only — ignore body content.\n"
+            "- The section number in the query is a hint; if the title "
+            "matches but the number differs slightly, still select it.\n"
+            "- If multiple headings match, pick the most specific one.\n\n"
+            "Respond with ONLY the number in square brackets, e.g.: 5\n"
+            "If no heading matches, respond with: NONE"
+        )),
+        ("human", "{headings}"),
+    ])
+
+    result = (prompt | llm).invoke({"headings": headings_text})
+    answer = result.content.strip()
+
+    if answer.upper() == "NONE":
+        return None
+
+    m = re.search(r'\d+', answer)
+    if m:
+        idx = int(m.group())
+        if 0 <= idx < len(unique_chunks):
+            return _chunk_to_doc(unique_chunks[idx])
+
+    return None
+
 
 def retrieve_candidates(
     vector_store: InMemoryVectorStore,
@@ -47,16 +131,13 @@ def retrieve_candidates(
     top_k: int = 8,
 ) -> list[tuple[Document, float]]:
     """
-    Hybrid search: semantic similarity across multiple query angles PLUS
-    a direct keyword match on chunk headings.
-
-    The keyword pass guarantees the actual target section is always a
-    candidate even when generic terms (e.g. "The Facility") score lower
-    in embedding space than body text that merely mentions those words.
+    Fallback hybrid search used when heading selection fails.
+    Runs multiple query angles through the vector store and also
+    injects any chunks whose heading contains the query text at
+    maximum score so they always appear at the top.
     """
     seen: dict[int, tuple[Document, float]] = {}
 
-    # Multiple query angles improve recall for short or generic queries.
     queries = [
         section_query,
         f"Section {section_query}",
@@ -69,24 +150,10 @@ def retrieve_candidates(
             if chunk_id not in seen or score > seen[chunk_id][1]:
                 seen[chunk_id] = (doc, score)
 
-    # Keyword pass: any chunk whose heading contains the query text gets
-    # a perfect score so it always appears at the top of the candidate list,
-    # regardless of how the embeddings ranked it.
     query_lower = section_query.lower()
     for chunk in chunks:
         if query_lower in chunk.heading.lower() and chunk.chunk_id not in seen:
-            doc = Document(
-                page_content=chunk.full_text,
-                metadata={
-                    "chunk_id": chunk.chunk_id,
-                    "heading": chunk.heading,
-                    "pages": chunk.pages,
-                    "start_page": chunk.start_page,
-                    "content_length": len(chunk.content),
-                    "heading_level": chunk.heading_level,
-                },
-            )
-            seen[chunk.chunk_id] = (doc, 1.0)
+            seen[chunk.chunk_id] = (_chunk_to_doc(chunk), 1.0)
 
     return sorted(seen.values(), key=lambda x: -x[1])
 
@@ -241,17 +308,31 @@ def extract_section(
         model=embedding_model,
     )
 
-    print(f"[6/7] Retrieving & ranking candidates for: '{section_query}'...")
-    candidates = retrieve_candidates(vector_store, section_query, chunks)
-    print(f"      → {len(candidates)} unique candidates from semantic search")
-    best = pick_best_with_llm(
-        candidates,
+    print(f"[6/7] Selecting section for: '{section_query}'...")
+    # Primary: LLM selects from heading list only — section-strict, no body
+    # text confusion.  Fallback: hybrid semantic + keyword search when the
+    # heading pass returns nothing (e.g. unnumbered or ambiguous titles).
+    best = select_heading_with_llm(
+        chunks,
         section_query=section_query,
         llm_model=llm_model,
         base_url=ollama_base_url,
         api_key=ollama_api_key,
     )
-    print(f"      → LLM selected: {best.metadata.get('heading', '?')}")
+    if best is not None:
+        print(f"      → Heading match: {best.metadata.get('heading', '?')}")
+    else:
+        print("      → No heading match; falling back to semantic search...")
+        candidates = retrieve_candidates(vector_store, section_query, chunks)
+        print(f"      → {len(candidates)} candidates from semantic search")
+        best = pick_best_with_llm(
+            candidates,
+            section_query=section_query,
+            llm_model=llm_model,
+            base_url=ollama_base_url,
+            api_key=ollama_api_key,
+        )
+        print(f"      → LLM selected: {best.metadata.get('heading', '?')}")
 
     print("[7/7] Gathering full section...")
     section_chunks = gather_full_section(best, chunks)
