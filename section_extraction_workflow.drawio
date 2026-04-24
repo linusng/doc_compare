@@ -1,0 +1,228 @@
+<mxfile host="app.diagrams.net" version="21.0.0">
+  <diagram name="Section Extraction Workflow" id="section-extract-workflow">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="1654" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- START -->
+        <mxCell id="2" value="PDF Input" style="ellipse;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="310" y="30" width="180" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- PHASE 1 -->
+        <mxCell id="3" value="[1/7] Extract Structured Blocks&#xa;PyMuPDF · font size · bold flags per span" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="115" width="300" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- PHASE 2 -->
+        <mxCell id="4" value="[2/7] Filter TOC Pages&#xa;LLM classifies first N pages · removes TOC blocks&#xa;Sanity check: consecutive pages, max 5" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="195" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- PHASE 3 -->
+        <mxCell id="5" value="[3/7] Chunk by Section&#xa;Heading detection → one SectionChunk per heading&#xa;Supports numbered (1.1) and named (Schedule 2)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="285" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- PHASE 4 -->
+        <mxCell id="6" value="[4/7] Split Oversized Chunks&#xa;Token-safe split with BGE-M3 tokenizer&#xa;Preserves heading metadata in every part" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="375" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- PHASE 5 -->
+        <mxCell id="7" value="[5/7] Build Vector Store&#xa;Embed all chunks (InMemoryVectorStore)&#xa;via configured embedding model" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="465" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- PHASE 6 -->
+        <mxCell id="8" value="[6/7] Select Heading with LLM&#xa;All unique headings presented to LLM&#xa;LLM returns up to N ranked matches (best first)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="555" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- DECISION: Heading candidates found? -->
+        <mxCell id="9" value="Heading candidates&#xa;found?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="290" y="650" width="220" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- SEMANTIC FALLBACK -->
+        <mxCell id="10" value="Semantic Search Fallback&#xa;retrieve_candidates&#xa;(multi-query + heading keyword boost)&#xa;→ pick_best_with_llm" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="638" width="230" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- APPEND SEMANTIC -->
+        <mxCell id="11" value="Append Semantic Candidates&#xa;Heading matches first · semantic fallbacks appended&#xa;Deduplicated by chunk_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="770" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- RETRY LOOP BADGE -->
+        <mxCell id="12" value="↺  RETRY LOOP" style="text;html=1;strokeColor=#82b366;fillColor=#d5e8d4;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=1;fontStyle=1;fontSize=11;fontColor=#2d6a2d;" vertex="1" parent="1">
+          <mxGeometry x="50" y="858" width="150" height="32" as="geometry" />
+        </mxCell>
+
+        <!-- GATHER FULL SECTION -->
+        <mxCell id="13" value="[7/7] Gather Full Section&#xa;Walk chunks: numbered (1.x children) or&#xa;named prefix (Schedule/Annex/Appendix siblings)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="858" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- MERGE -->
+        <mxCell id="14" value="Merge Section Chunks&#xa;Combine content · unified sorted page list" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="948" width="300" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- DECISION: verify? -->
+        <mxCell id="15" value="verify=True?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="290" y="1030" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- RETURN (no verify) -->
+        <mxCell id="16" value="Return Result&#xa;(verified=False by default)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="1037" width="210" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- VERIFY WITH LLM -->
+        <mxCell id="17" value="Verify with LLM&#xa;Confirm extracted content matches section_query" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="250" y="1135" width="300" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- DECISION: Confirmed? -->
+        <mxCell id="18" value="Confirmed?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="290" y="1220" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- RETURN VERIFIED -->
+        <mxCell id="19" value="Return Result&#xa;(verified=True) ✓" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="1227" width="210" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- DECISION: More candidates? -->
+        <mxCell id="20" value="More candidates?" style="rhombus;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="290" y="1325" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- RETURN LAST -->
+        <mxCell id="21" value="Return Last Result&#xa;(verified=False)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="600" y="1332" width="210" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- END -->
+        <mxCell id="22" value="ExtractionResult" style="ellipse;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="620" y="1440" width="180" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- ── EDGES ── -->
+
+        <mxCell id="30" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="2" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="31" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="3" target="4" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="32" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="4" target="5" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="33" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="5" target="6" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="34" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="6" target="7" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="35" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="7" target="8" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="36" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="8" target="9" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Yes → Append Semantic (straight down) -->
+        <mxCell id="37" value="Yes" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" source="9" target="11" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- No → Semantic Fallback (right) -->
+        <mxCell id="38" value="No" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="9" target="10" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Semantic Fallback → Append Semantic -->
+        <mxCell id="39" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="10" target="11" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Append Semantic → Gather Full Section -->
+        <mxCell id="40" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="11" target="13" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="41" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="13" target="14" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="42" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="14" target="15" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- verify? No → Return (no verify) -->
+        <mxCell id="43" value="No" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="15" target="16" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- verify? Yes → Verify with LLM -->
+        <mxCell id="44" value="Yes" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" source="15" target="17" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="45" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="17" target="18" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Confirmed? Yes → Return Verified -->
+        <mxCell id="46" value="Yes" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="18" target="19" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Confirmed? No → More candidates? -->
+        <mxCell id="47" value="No" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" source="18" target="20" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- More candidates? No → Return Last -->
+        <mxCell id="48" value="No" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;" edge="1" source="20" target="21" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- More candidates? Yes → loop back left to Gather Full Section -->
+        <mxCell id="49" value="Yes (next candidate)" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" source="20" target="13" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="90" y="1360" />
+              <mxPoint x="90" y="888" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Return (no verify) → ExtractionResult -->
+        <mxCell id="50" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="16" target="22" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Return Verified → ExtractionResult -->
+        <mxCell id="51" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="19" target="22" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Return Last → ExtractionResult -->
+        <mxCell id="52" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" source="21" target="22" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
