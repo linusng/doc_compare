@@ -13,22 +13,27 @@ What this stage does
 overlap with the CP value.  Not all of them are directly relevant, and the
 same section may appear as several numbered "part" chunks.
 
-`extract_evidence` collapses that list in three steps:
+`extract_evidence` collapses that list in two steps:
 
   Step 1 — Part-chunk deduplication
-    Merge candidate sections that share the same base heading (stripping
-    " (part N)" suffixes) so the LLM sees whole sections, not fragments.
+    Merge candidates that share the same base heading (stripping "(part N)"
+    suffixes) into single entries so each FA section appears once.
 
-  Step 2 — LLM filter (primary)
-    The LLM reads the deduplicated list and selects the SMALLEST set of
-    sections that fully covers the CP value.  Typically 1–3 sections for
-    a well-defined CP field.
+  Step 2 — Strict token-score filter
+    Extract every meaningful token from both the CP field name and the CP
+    value (all-caps abbreviations, numbers, percentages, and significant
+    words).  Score each candidate by the number of distinct CP tokens it
+    contains.  Keep only candidates whose score meets the threshold:
 
-  Step 3 — Specific-token safety net (additive)
-    After the LLM has made its selection, scan the passages it dropped for
-    highly specific tokens extracted directly from the CP value: all-caps
-    benchmark names (SONIA, GBP, LIBOR), exact numbers, and percentages.
-    Any dropped passage that contains such a token is added back.
+      • score ≥ 2  when the CP value has ≥ 2 distinct tokens
+      • score ≥ 1  when the CP value has only 1 distinct token
+
+    If nothing clears the threshold, the single highest-scoring candidate
+    is kept as a fallback so the downstream comparison never runs blind.
+
+This is intentionally strict — passages that only share a generic keyword
+with the CP value (e.g. the word "interest" appearing in a boilerplate
+clause) will score 0 or 1 and be dropped.
 
 Python API
 ----------
@@ -38,15 +43,13 @@ Python API
     collated = run_collate(index, "Margin: GBP SONIA + 0.8% p.a.")
     evidence = extract_evidence("Margin", "GBP: SONIA + 0.8% p.a.", collated)
 
-    print(evidence.filtered_context)     # feed directly to analyze_deviation
+    print(evidence.filtered_context)
     for sec in evidence.selected_sections:
         print(sec.heading, sec.pages)
 """
 
 import re
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from .models import CollatedResult, SectionEvidence
@@ -58,39 +61,89 @@ class ExtractedEvidence(BaseModel):
     """
     Filtered evidence for one CP field.
 
-    selected_sections  : the subset of CollatedResult.evidence kept as relevant
-                         (after deduplication and merging of part-chunks).
-                         LLM selections appear first, safety-net additions after.
-    llm_selected_count : how many (deduplicated) sections the LLM chose.
-    safety_added_count : how many dropped sections were rescued by the safety net.
-    dropped_count      : how many (deduplicated) candidates were filtered out.
-    filtered_context   : formatted string ready for the comparison agent.
+    selected_sections : candidates that passed the token-score filter.
+    kept_count        : number of sections kept.
+    dropped_count     : number of sections dropped.
+    filtered_context  : formatted string ready for the comparison agent.
     """
     cp_field: str
     cp_value: str
-    selected_sections: list       # list[SectionEvidence]
-    llm_selected_count: int
-    safety_added_count: int
+    selected_sections: list   # list[SectionEvidence]
+    kept_count: int
     dropped_count: int
     filtered_context: str
 
 
-# ── Step 1: Part-chunk deduplication ─────────────────────────────────────────
+# ── Token extraction ──────────────────────────────────────────────────────────
 
+# Noise words excluded from field-name token extraction
+_STOP_WORDS = {
+    "the", "and", "or", "of", "in", "to", "a", "an", "for",
+    "from", "with", "by", "as", "at", "on", "is", "its",
+}
+
+# Regex patterns for high-specificity tokens from the CP value
+_CAPS_RE   = re.compile(r'\b[A-Z]{2,}\b')          # SONIA, GBP, LIBOR, USD
+_NUMBER_RE = re.compile(r'\b\d[\d,\.]*%?\b')        # 0.8%, 50,000,000, 3
 _PART_SUFFIX_RE = re.compile(r'\s*\(part\s*\d+\)\s*$', re.IGNORECASE)
 
 
+def _cp_value_tokens(cp_value: str) -> set[str]:
+    """
+    Extract every meaningful token from the CP value.
+
+    Captures:
+      - All-caps abbreviations / benchmarks  : SONIA, GBP, LIBOR, EURIBOR
+      - Numbers and percentages              : 0.8%, 50000000, 3.5
+      - Significant mixed-case words (≥4 ch) : "Margin", "Maturity", "Extension"
+
+    These tokens are the direct subject matter of the CP value — a relevant
+    FA passage must contain at least some of them.
+    """
+    tokens: set[str] = set()
+
+    # All-caps abbreviations
+    for m in _CAPS_RE.finditer(cp_value):
+        tokens.add(m.group().lower())
+
+    # Numbers / percentages
+    for m in _NUMBER_RE.finditer(cp_value):
+        tok = m.group().lower()
+        if len(tok) >= 2:
+            tokens.add(tok)
+
+    # Significant words (≥4 chars, not stop words)
+    for word in re.findall(r'[A-Za-z]{4,}', cp_value):
+        w = word.lower()
+        if w not in _STOP_WORDS:
+            tokens.add(w)
+
+    return tokens
+
+
+def _cp_field_tokens(cp_field: str) -> set[str]:
+    """
+    Extract significant words from the CP field name (≥4 chars, not stop words).
+    Used only as a secondary signal — not counted toward the score threshold.
+    """
+    tokens: set[str] = set()
+    for word in re.findall(r'[A-Za-z]{4,}', cp_field):
+        w = word.lower()
+        if w not in _STOP_WORDS:
+            tokens.add(w)
+    return tokens
+
+
+# ── Part-chunk deduplication ──────────────────────────────────────────────────
+
 def _merge_part_chunks(sections: list[SectionEvidence]) -> list[SectionEvidence]:
     """
-    Merge SectionEvidence entries that come from the same base section
-    (i.e. their headings differ only by a ' (part N)' suffix).
-
-    Parts are merged in order: pages are unioned, excerpts are concatenated
-    with a separator, and matched_terms are unioned.  The result is a shorter
-    list of complete sections rather than multiple fragments.
+    Merge SectionEvidence entries that share the same base heading
+    (differing only by a " (part N)" suffix).  Pages and matched_terms
+    are unioned; excerpts are concatenated.
     """
-    merged: dict[str, dict] = {}   # base_heading → accumulated fields
-    order: list[str] = []           # insertion order
+    merged: dict[str, dict] = {}
+    order: list[str] = []
 
     for sec in sections:
         base = _PART_SUFFIX_RE.sub("", sec.heading).strip()
@@ -105,85 +158,33 @@ def _merge_part_chunks(sections: list[SectionEvidence]) -> list[SectionEvidence]
             order.append(base)
         else:
             acc = merged[base]
-            # union pages (preserve order, no duplicates)
             for p in sec.pages:
                 if p not in acc["pages"]:
                     acc["pages"].append(p)
-            # union matched terms
             for t in sec.matched_terms:
                 if t not in acc["matched_terms"]:
                     acc["matched_terms"].append(t)
-            # concatenate excerpt
             acc["excerpt"] += "\n\n" + sec.excerpt
 
-    return [
-        SectionEvidence(**merged[base])
-        for base in order
-    ]
+    return [SectionEvidence(**merged[base]) for base in order]
 
 
-# ── Step 3: Specific-token safety net ─────────────────────────────────────────
+# ── Scoring ───────────────────────────────────────────────────────────────────
 
-_MIN_TOKEN_CHARS = 3
-
-# All-caps abbreviations / benchmarks: SONIA, GBP, LIBOR, SOFR, EURIBOR
-_CAPS_TOKEN_RE = re.compile(r'\b[A-Z]{3,}\b')
-
-# Numbers and percentages: 0.8%, 50,000,000, 3
-_NUMBER_RE = re.compile(r'\b\d[\d,\.]*%?\b')
-
-
-def _extract_specific_tokens(cp_value: str) -> set[str]:
+def _score(sec: SectionEvidence, value_tokens: set[str]) -> int:
     """
-    Pull highly specific tokens out of the CP value for the safety net:
-      - All-caps abbreviations / benchmarks  (SONIA, GBP, LIBOR)
-      - Numbers and percentages              (0.8%, 50,000,000)
-
-    These are tokens we cannot afford to miss — if a dropped candidate
-    contains one verbatim, it is added back.
+    Count how many distinct CP-value tokens appear in the section text
+    (heading + excerpt, case-insensitive).
     """
-    tokens: set[str] = set()
-    for m in _CAPS_TOKEN_RE.finditer(cp_value):
-        tok = m.group().lower()
-        if len(tok) >= _MIN_TOKEN_CHARS:
-            tokens.add(tok)
-    for m in _NUMBER_RE.finditer(cp_value):
-        tok = m.group().lower()
-        if len(tok) >= _MIN_TOKEN_CHARS:
-            tokens.add(tok)
-    return tokens
+    searchable = (sec.heading + " " + sec.excerpt).lower()
+    return sum(1 for tok in value_tokens if tok in searchable)
 
 
-# ── Prompt helpers ────────────────────────────────────────────────────────────
-
-def _format_candidates(
-    candidates: list[SectionEvidence],
-    max_chars_per_section: int = 1500,
-) -> str:
-    """
-    Render the deduplicated candidate passages as a numbered list for the LLM.
-    """
-    parts = []
-    for i, sec in enumerate(candidates):
-        excerpt = sec.excerpt.strip()
-        if len(excerpt) > max_chars_per_section:
-            excerpt = excerpt[:max_chars_per_section] + "\n[… truncated]"
-        parts.append(
-            f"[{i}] {sec.heading}  (pages {sec.pages})\n"
-            f"{'─' * 50}\n"
-            f"{excerpt}"
-        )
-    return "\n\n".join(parts)
-
+# ── Formatting ────────────────────────────────────────────────────────────────
 
 def _render_filtered_context(sections: list[SectionEvidence]) -> str:
-    """
-    Format the selected sections as a clean context block for the
-    downstream comparison agent.
-    """
     if not sections:
         return "(No directly relevant FA passages found.)"
-
     parts = []
     for sec in sections:
         parts.append(
@@ -200,136 +201,66 @@ def extract_evidence(
     cp_field: str,
     cp_value: str,
     collated: CollatedResult,
-    llm_model: str = "gemma3-27b-it",
-    base_url: str = "http://localhost:11434/v1",
-    api_key: str = "ollama",
-    max_chars_per_section: int = 1500,
+    **_kwargs,   # absorbs llm_model / base_url / api_key — no longer needed
 ) -> ExtractedEvidence:
     """
-    Collapse the collated FA candidate passages down to those most directly
-    relevant to the CP value.
+    Filter collated FA passages down to those that directly address the CP value.
 
-    Step 1 — Deduplication
-        Merge part-chunks (same base heading) so the LLM sees whole sections.
-
-    Step 2 — LLM filter
-        The LLM selects the smallest set of sections that fully covers the CP
-        value.  Instructed to be strict: typically 1–3 sections.
-
-    Step 3 — Safety net
-        Any section dropped by the LLM but containing a highly specific token
-        from the CP value (all-caps benchmark, exact number/%) is added back.
+    Step 1 — Deduplicate part-chunks (merge "(part N)" fragments per section).
+    Step 2 — Score each section by the number of CP-value tokens it contains.
+              Keep only sections that meet the minimum score threshold.
     """
     if not collated.evidence:
         return ExtractedEvidence(
             cp_field=cp_field,
             cp_value=cp_value,
             selected_sections=[],
-            llm_selected_count=0,
-            safety_added_count=0,
+            kept_count=0,
             dropped_count=0,
             filtered_context="(No FA passages were retrieved for this CP field.)",
         )
 
-    # ── Step 1: Deduplicate part-chunks ───────────────────────────────────────
-    candidates: list[SectionEvidence] = _merge_part_chunks(collated.evidence)
+    # ── Step 1: Merge part-chunks ─────────────────────────────────────────────
+    candidates = _merge_part_chunks(collated.evidence)
     n_raw = len(collated.evidence)
     n = len(candidates)
-
     print(f"         → Deduplicated {n_raw} chunk(s) → {n} section(s)")
 
-    # ── Step 2: LLM filter ────────────────────────────────────────────────────
-    candidates_text = _format_candidates(candidates, max_chars_per_section)
+    # ── Step 2: Token-score filter ────────────────────────────────────────────
+    value_tokens = _cp_value_tokens(cp_value)
+    field_tokens = _cp_field_tokens(cp_field)
+    all_tokens   = value_tokens | field_tokens
 
-    llm = ChatOpenAI(
-        model=llm_model, base_url=base_url, api_key=api_key, temperature=0,
-    )
+    print(f"         → CP value tokens : {sorted(value_tokens)}")
+    print(f"         → CP field tokens : {sorted(field_tokens)}")
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", (
-            "You are filtering candidate passages from a facility agreement (FA) "
-            "down to only those relevant to a specific CP form field.\n\n"
-            "KEEP a passage ONLY if it:\n"
-            "  - Directly states, defines, or governs the specific term, rate, "
-            "amount, date, or condition described in the CP value\n"
-            "  - Contains the specific benchmark, figure, or mechanism referenced "
-            "(e.g. if CP value mentions SONIA + 0.8%, keep passages that actually "
-            "set that rate — not passages that merely mention interest rates in passing)\n\n"
-            "DISCARD a passage if it:\n"
-            "  - Only uses a related keyword in a different context\n"
-            "  - Is a general definition, administrative provision, or boilerplate\n"
-            "  - Covers a related but distinct clause (e.g. a different interest rate, "
-            "a different tranche, an unrelated condition)\n"
-            "  - Repeats the same substance already covered by a passage you are keeping\n\n"
-            "TARGET: return the FEWEST passages possible — typically 1 to 3 for a "
-            "well-defined CP field.  Only return more if the CP value has genuinely "
-            "distinct aspects each requiring a separate passage.\n\n"
-            "Respond with ONLY the index numbers of passages you are KEEPING, "
-            "comma-separated, most relevant first.\n"
-            "Example: 2,0\n"
-            "If none are relevant, respond: NONE"
-        )),
-        ("human", (
-            "CP FIELD : {cp_field}\n"
-            "CP VALUE : {cp_value}\n\n"
-            "CANDIDATE PASSAGES ({n} total — select the fewest that fully cover the CP value):\n\n"
-            "{candidates}"
-        )),
-    ])
+    # Threshold: must match at least 2 value tokens when ≥2 exist, else 1.
+    threshold = min(2, len(value_tokens)) if value_tokens else 1
 
-    raw = (prompt | llm).invoke({
-        "cp_field":   cp_field,
-        "cp_value":   cp_value,
-        "n":          n,
-        "candidates": candidates_text,
-    }).content.strip()
+    scored: list[tuple[int, SectionEvidence]] = []
+    for sec in candidates:
+        s = _score(sec, value_tokens)
+        scored.append((s, sec))
+        print(f"         → [{s:2d}] {sec.heading}")
 
-    llm_selected_indices: list[int] = []
-    if raw.upper() != "NONE":
-        seen: set[int] = set()
-        for token in re.findall(r'\d+', raw):
-            idx = int(token)
-            if 0 <= idx < n and idx not in seen:
-                llm_selected_indices.append(idx)
-                seen.add(idx)
+    selected = [sec for s, sec in scored if s >= threshold]
 
-    llm_selected_set = set(llm_selected_indices)
-    llm_selected = [candidates[i] for i in llm_selected_indices]
-
-    print(f"         → LLM kept {len(llm_selected)}/{n}: "
-          f"{[candidates[i].heading for i in llm_selected_indices]}")
-
-    # ── Step 3: Safety net ────────────────────────────────────────────────────
-    specific_tokens = _extract_specific_tokens(cp_value)
-    print(f"         → Safety-net tokens: {specific_tokens}")
-
-    safety_added: list[SectionEvidence] = []
-    if specific_tokens:
-        for i, sec in enumerate(candidates):
-            if i in llm_selected_set:
-                continue
-            searchable = (sec.heading + " " + sec.excerpt).lower()
-            if any(tok in searchable for tok in specific_tokens):
-                safety_added.append(sec)
-                print(f"         → Safety net rescued: [{i}] {sec.heading}")
-
-    # ── Merge ─────────────────────────────────────────────────────────────────
-    selected = llm_selected + safety_added
-    dropped = n - len(selected)
-
+    # Fallback: if nothing passes, keep the single highest-scoring section.
     if not selected:
-        print("         → Both layers empty — keeping all deduplicated sections as fallback")
-        selected = candidates
-        dropped = 0
+        best_score, best_sec = max(scored, key=lambda x: x[0])
+        print(f"         → Nothing passed threshold ({threshold}) — "
+              f"keeping best scorer: {best_sec.heading} (score={best_score})")
+        selected = [best_sec]
 
-    filtered_context = _render_filtered_context(selected)
+    dropped = n - len(selected)
+    print(f"         → Kept {len(selected)}/{n} section(s) "
+          f"(threshold={threshold}, dropped={dropped})")
 
     return ExtractedEvidence(
         cp_field=cp_field,
         cp_value=cp_value,
         selected_sections=selected,
-        llm_selected_count=len(llm_selected),
-        safety_added_count=len(safety_added),
+        kept_count=len(selected),
         dropped_count=dropped,
-        filtered_context=filtered_context,
+        filtered_context=_render_filtered_context(selected),
     )
