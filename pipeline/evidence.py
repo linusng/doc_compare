@@ -10,25 +10,25 @@ Pipeline position
 What this stage does
 --------------------
 `run_collate` casts a wide net — it retrieves every FA passage whose terms
-overlap with the CP value.  Not all of them are directly relevant.
+overlap with the CP value.  Not all of them are directly relevant, and the
+same section may appear as several numbered "part" chunks.
 
-`extract_evidence` collapses that list in two layers:
+`extract_evidence` collapses that list in three steps:
 
-  Layer 1 — LLM filter (primary)
-    The LLM reads all candidates and selects only those passages that are
-    most directly and specifically relevant to the CP value.  It acts as a
-    strict filter: aim for the smallest set that fully covers the CP value.
+  Step 1 — Part-chunk deduplication
+    Merge candidate sections that share the same base heading (stripping
+    " (part N)" suffixes) so the LLM sees whole sections, not fragments.
 
-  Layer 2 — Specific-token safety net (additive)
+  Step 2 — LLM filter (primary)
+    The LLM reads the deduplicated list and selects the SMALLEST set of
+    sections that fully covers the CP value.  Typically 1–3 sections for
+    a well-defined CP field.
+
+  Step 3 — Specific-token safety net (additive)
     After the LLM has made its selection, scan the passages it dropped for
     highly specific tokens extracted directly from the CP value: all-caps
-    benchmark names (SONIA, LIBOR, GBP), exact numbers, and percentages.
-    Any dropped passage that contains such a token is added back — this
-    ensures the LLM cannot accidentally discard a passage that contains a
-    verbatim financial figure or benchmark name.
-
-The final result is the union of both layers, LLM selections listed first,
-then any safety-net additions.
+    benchmark names (SONIA, GBP, LIBOR), exact numbers, and percentages.
+    Any dropped passage that contains such a token is added back.
 
 Python API
 ----------
@@ -58,11 +58,12 @@ class ExtractedEvidence(BaseModel):
     """
     Filtered evidence for one CP field.
 
-    selected_sections  : the subset of CollatedResult.evidence kept as relevant.
+    selected_sections  : the subset of CollatedResult.evidence kept as relevant
+                         (after deduplication and merging of part-chunks).
                          LLM selections appear first, safety-net additions after.
-    llm_selected_count : how many sections the LLM chose.
+    llm_selected_count : how many (deduplicated) sections the LLM chose.
     safety_added_count : how many dropped sections were rescued by the safety net.
-    dropped_count      : how many candidates were filtered out entirely.
+    dropped_count      : how many (deduplicated) candidates were filtered out.
     filtered_context   : formatted string ready for the comparison agent.
     """
     cp_field: str
@@ -74,41 +75,82 @@ class ExtractedEvidence(BaseModel):
     filtered_context: str
 
 
-# ── Specific-token extraction (safety net) ────────────────────────────────────
+# ── Step 1: Part-chunk deduplication ─────────────────────────────────────────
 
-# Minimum length for a token to be used in the safety net
+_PART_SUFFIX_RE = re.compile(r'\s*\(part\s*\d+\)\s*$', re.IGNORECASE)
+
+
+def _merge_part_chunks(sections: list[SectionEvidence]) -> list[SectionEvidence]:
+    """
+    Merge SectionEvidence entries that come from the same base section
+    (i.e. their headings differ only by a ' (part N)' suffix).
+
+    Parts are merged in order: pages are unioned, excerpts are concatenated
+    with a separator, and matched_terms are unioned.  The result is a shorter
+    list of complete sections rather than multiple fragments.
+    """
+    merged: dict[str, dict] = {}   # base_heading → accumulated fields
+    order: list[str] = []           # insertion order
+
+    for sec in sections:
+        base = _PART_SUFFIX_RE.sub("", sec.heading).strip()
+
+        if base not in merged:
+            merged[base] = {
+                "heading":       base,
+                "pages":         list(sec.pages),
+                "matched_terms": list(sec.matched_terms),
+                "excerpt":       sec.excerpt,
+            }
+            order.append(base)
+        else:
+            acc = merged[base]
+            # union pages (preserve order, no duplicates)
+            for p in sec.pages:
+                if p not in acc["pages"]:
+                    acc["pages"].append(p)
+            # union matched terms
+            for t in sec.matched_terms:
+                if t not in acc["matched_terms"]:
+                    acc["matched_terms"].append(t)
+            # concatenate excerpt
+            acc["excerpt"] += "\n\n" + sec.excerpt
+
+    return [
+        SectionEvidence(**merged[base])
+        for base in order
+    ]
+
+
+# ── Step 3: Specific-token safety net ─────────────────────────────────────────
+
 _MIN_TOKEN_CHARS = 3
 
-# Matches all-uppercase abbreviations / benchmark names: SONIA, GBP, LIBOR, SOFR
+# All-caps abbreviations / benchmarks: SONIA, GBP, LIBOR, SOFR, EURIBOR
 _CAPS_TOKEN_RE = re.compile(r'\b[A-Z]{3,}\b')
 
-# Matches numbers and percentages: 0.8%, 50,000,000, 1.5
+# Numbers and percentages: 0.8%, 50,000,000, 3
 _NUMBER_RE = re.compile(r'\b\d[\d,\.]*%?\b')
 
 
 def _extract_specific_tokens(cp_value: str) -> set[str]:
     """
-    Pull highly specific tokens out of the CP value for use as a safety net.
+    Pull highly specific tokens out of the CP value for the safety net:
+      - All-caps abbreviations / benchmarks  (SONIA, GBP, LIBOR)
+      - Numbers and percentages              (0.8%, 50,000,000)
 
-    Captures:
-      - All-caps abbreviations / benchmarks  (SONIA, LIBOR, GBP, EUR, SOFR)
-      - Numbers and percentages              (0.8%, 50,000,000, 3)
-
-    These are the tokens we cannot afford to miss — if a candidate contains
-    one verbatim, it stays even if the LLM filtered it out.
+    These are tokens we cannot afford to miss — if a dropped candidate
+    contains one verbatim, it is added back.
     """
     tokens: set[str] = set()
-
     for m in _CAPS_TOKEN_RE.finditer(cp_value):
         tok = m.group().lower()
         if len(tok) >= _MIN_TOKEN_CHARS:
             tokens.add(tok)
-
     for m in _NUMBER_RE.finditer(cp_value):
         tok = m.group().lower()
         if len(tok) >= _MIN_TOKEN_CHARS:
             tokens.add(tok)
-
     return tokens
 
 
@@ -116,18 +158,16 @@ def _extract_specific_tokens(cp_value: str) -> set[str]:
 
 def _format_candidates(
     candidates: list[SectionEvidence],
-    max_chars_per_section: int = 1000,
+    max_chars_per_section: int = 1500,
 ) -> str:
     """
-    Render the candidate passages as a numbered list for the LLM.
-    Each entry shows the section heading, pages, and a truncated excerpt.
+    Render the deduplicated candidate passages as a numbered list for the LLM.
     """
     parts = []
     for i, sec in enumerate(candidates):
         excerpt = sec.excerpt.strip()
         if len(excerpt) > max_chars_per_section:
             excerpt = excerpt[:max_chars_per_section] + "\n[… truncated]"
-
         parts.append(
             f"[{i}] {sec.heading}  (pages {sec.pages})\n"
             f"{'─' * 50}\n"
@@ -163,35 +203,22 @@ def extract_evidence(
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
-    max_chars_per_section: int = 1000,
+    max_chars_per_section: int = 1500,
 ) -> ExtractedEvidence:
     """
     Collapse the collated FA candidate passages down to those most directly
-    relevant to the CP value, using a two-layer approach:
+    relevant to the CP value.
 
-    Layer 1 — LLM filter (primary)
-        The LLM reviews all candidates and selects the smallest subset that
-        fully covers the CP value.  It is instructed to be strict — only
-        passages that directly define, state, or govern the specific term,
-        rate, amount, or date mentioned in the CP value should be kept.
+    Step 1 — Deduplication
+        Merge part-chunks (same base heading) so the LLM sees whole sections.
 
-    Layer 2 — Specific-token safety net (additive)
-        Any passage that the LLM dropped but that contains a highly specific
-        token from the CP value (all-caps benchmarks like SONIA, currency
-        codes, exact numbers/percentages) is added back.  This prevents the
-        LLM from accidentally discarding passages with verbatim financial
-        figures or benchmark names.
+    Step 2 — LLM filter
+        The LLM selects the smallest set of sections that fully covers the CP
+        value.  Instructed to be strict: typically 1–3 sections.
 
-    Parameters
-    ----------
-    cp_field              : CP form field name, e.g. "Margin".
-    cp_value              : CP form value, e.g. "GBP: SONIA + 0.8% p.a.".
-    collated              : CollatedResult from run_collate().
-    max_chars_per_section : Max characters shown per candidate in the LLM prompt.
-
-    Returns
-    -------
-    ExtractedEvidence
+    Step 3 — Safety net
+        Any section dropped by the LLM but containing a highly specific token
+        from the CP value (all-caps benchmark, exact number/%) is added back.
     """
     if not collated.evidence:
         return ExtractedEvidence(
@@ -204,12 +231,14 @@ def extract_evidence(
             filtered_context="(No FA passages were retrieved for this CP field.)",
         )
 
-    candidates: list[SectionEvidence] = collated.evidence
+    # ── Step 1: Deduplicate part-chunks ───────────────────────────────────────
+    candidates: list[SectionEvidence] = _merge_part_chunks(collated.evidence)
+    n_raw = len(collated.evidence)
     n = len(candidates)
 
-    # ── Layer 1: LLM filter ───────────────────────────────────────────────────
-    # The LLM sees all candidates and selects only the most directly relevant.
-    # It is the primary decision-maker — we want strict filtering here.
+    print(f"         → Deduplicated {n_raw} chunk(s) → {n} section(s)")
+
+    # ── Step 2: LLM filter ────────────────────────────────────────────────────
     candidates_text = _format_candidates(candidates, max_chars_per_section)
 
     llm = ChatOpenAI(
@@ -218,33 +247,32 @@ def extract_evidence(
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", (
-            "You are filtering candidate passages retrieved from a facility agreement (FA).\n\n"
-            "Your task: given a CP field name and its value, select ONLY the passages that "
-            "are most directly and specifically relevant to it.\n\n"
-            "KEEP a passage if it:\n"
-            "  - Directly defines, states, or governs the specific term, rate, amount, "
-            "date, or mechanism described in the CP value\n"
-            "  - Contains the specific rate, benchmark, figure, or condition referenced "
-            "(e.g. if the CP value mentions SONIA, keep passages that actually set or "
-            "describe the SONIA-based margin or rate)\n\n"
+            "You are filtering candidate passages from a facility agreement (FA) "
+            "down to only those relevant to a specific CP form field.\n\n"
+            "KEEP a passage ONLY if it:\n"
+            "  - Directly states, defines, or governs the specific term, rate, "
+            "amount, date, or condition described in the CP value\n"
+            "  - Contains the specific benchmark, figure, or mechanism referenced "
+            "(e.g. if CP value mentions SONIA + 0.8%, keep passages that actually "
+            "set that rate — not passages that merely mention interest rates in passing)\n\n"
             "DISCARD a passage if it:\n"
-            "  - Only mentions a related term in passing or in a different context\n"
-            "  - Covers a different clause that happens to share a keyword\n"
-            "  - Is general boilerplate, definitions, or administrative text with no "
-            "specific bearing on this CP value\n"
-            "  - Discusses the concept generally without the specific values, rates, "
-            "or dates stated in the CP value\n\n"
-            "Be STRICT. Aim for the smallest set of passages that fully covers the "
-            "CP value. If only 1 or 2 passages are truly relevant, return only those.\n\n"
-            "Respond with ONLY the index numbers of the passages you are KEEPING, "
+            "  - Only uses a related keyword in a different context\n"
+            "  - Is a general definition, administrative provision, or boilerplate\n"
+            "  - Covers a related but distinct clause (e.g. a different interest rate, "
+            "a different tranche, an unrelated condition)\n"
+            "  - Repeats the same substance already covered by a passage you are keeping\n\n"
+            "TARGET: return the FEWEST passages possible — typically 1 to 3 for a "
+            "well-defined CP field.  Only return more if the CP value has genuinely "
+            "distinct aspects each requiring a separate passage.\n\n"
+            "Respond with ONLY the index numbers of passages you are KEEPING, "
             "comma-separated, most relevant first.\n"
             "Example: 2,0\n"
-            "If none of the passages are relevant, respond with: NONE"
+            "If none are relevant, respond: NONE"
         )),
         ("human", (
             "CP FIELD : {cp_field}\n"
             "CP VALUE : {cp_value}\n\n"
-            "CANDIDATE PASSAGES ({n} total):\n\n"
+            "CANDIDATE PASSAGES ({n} total — select the fewest that fully cover the CP value):\n\n"
             "{candidates}"
         )),
     ])
@@ -268,12 +296,10 @@ def extract_evidence(
     llm_selected_set = set(llm_selected_indices)
     llm_selected = [candidates[i] for i in llm_selected_indices]
 
-    print(f"         → LLM selected {len(llm_selected)}/{n} passage(s): "
+    print(f"         → LLM kept {len(llm_selected)}/{n}: "
           f"{[candidates[i].heading for i in llm_selected_indices]}")
 
-    # ── Layer 2: Specific-token safety net ────────────────────────────────────
-    # Among the passages the LLM dropped, rescue any that contain a highly
-    # specific token from the CP value (all-caps benchmarks, numbers, percentages).
+    # ── Step 3: Safety net ────────────────────────────────────────────────────
     specific_tokens = _extract_specific_tokens(cp_value)
     print(f"         → Safety-net tokens: {specific_tokens}")
 
@@ -281,19 +307,18 @@ def extract_evidence(
     if specific_tokens:
         for i, sec in enumerate(candidates):
             if i in llm_selected_set:
-                continue   # already kept
+                continue
             searchable = (sec.heading + " " + sec.excerpt).lower()
             if any(tok in searchable for tok in specific_tokens):
                 safety_added.append(sec)
                 print(f"         → Safety net rescued: [{i}] {sec.heading}")
 
-    # ── Merge: LLM selections first, then safety-net rescues ─────────────────
+    # ── Merge ─────────────────────────────────────────────────────────────────
     selected = llm_selected + safety_added
     dropped = n - len(selected)
 
-    # Fallback: if both layers returned nothing, keep all candidates.
     if not selected:
-        print("         → Both layers returned nothing — keeping all candidates as fallback")
+        print("         → Both layers empty — keeping all deduplicated sections as fallback")
         selected = candidates
         dropped = 0
 
