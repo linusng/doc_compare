@@ -74,33 +74,166 @@ def extract_key_terms(
     ]
 
 
+# ── Keyword match score constants ─────────────────────────────────────────────
+#
+# Dense embeddings handle meaning well but are weak on exact short tokens:
+# acronyms (SONIA, EURIBOR), currency codes (GBP, USD), specific figures
+# (0.8%, 50,000,000).  Keyword injection bypasses the embedding entirely for
+# these cases, assigning a fixed "guaranteed inclusion" score.
+#
+# Score hierarchy:
+#   Heading match  1.00  — term appears in the section heading itself
+#   Body match     0.82  — term appears verbatim in the chunk body text
+#   Semantic hit   varies — embedding similarity (typically 0.35 – 0.95)
+#
+# Body match is set below 1.0 so that a chunk whose heading exactly names
+# the term still outranks one that only mentions it in passing.
+
+HEADING_MATCH_SCORE = 1.00
+BODY_MATCH_SCORE    = 0.82
+
+
+# ── Term expansion ────────────────────────────────────────────────────────────
+
+def expand_terms(
+    terms: list[str],
+    llm_model: str = "gemma3-27b-it",
+    base_url: str = "http://localhost:11434/v1",
+    api_key: str = "ollama",
+) -> dict[str, list[str]]:
+    """
+    For each extracted term, generate additional search variants:
+    full forms of acronyms, common synonyms, and alternative spellings.
+
+    This is essential for terms like:
+      "SONIA"    → ["SONIA", "Sterling Overnight Index Average"]
+      "EURIBOR"  → ["EURIBOR", "Euro Interbank Offered Rate"]
+      "GBP"      → ["GBP", "sterling", "pound sterling", "British pounds"]
+      "p.a."     → ["p.a.", "per annum", "per year"]
+
+    Returns a dict mapping each original term to a list of search variants
+    (the original term is always included as the first entry).
+
+    Note: this makes one LLM call covering all terms in a single batch,
+    not one call per term.
+    """
+    if not terms:
+        return {}
+
+    llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
+
+    terms_list = "\n".join(f"- {t}" for t in terms)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", (
+            "You are a financial and legal terminology expert.\n\n"
+            "For each term below, generate alternative search variants that "
+            "might appear in a formal legal or financial document:\n"
+            "- Acronyms → full English form (e.g. SONIA → Sterling Overnight Index Average)\n"
+            "- Currency codes → written forms (e.g. GBP → sterling, pound sterling)\n"
+            "- Abbreviations → full form (e.g. p.a. → per annum)\n"
+            "- Common synonyms used in facility agreements\n\n"
+            "Rules:\n"
+            "- Only add variants that would realistically appear in a UK/international "
+            "facility agreement.\n"
+            "- If a term needs no expansion (e.g. 'Final Maturity Date'), return only "
+            "the original.\n"
+            "- Do NOT invent variants — only include ones you are confident about.\n\n"
+            "Return ONLY valid JSON in this exact shape:\n"
+            '{"SONIA": ["SONIA", "Sterling Overnight Index Average"], '
+            '"GBP": ["GBP", "sterling", "pound sterling"], '
+            '"Final Maturity Date": ["Final Maturity Date"]}'
+        )),
+        ("human", f"Terms to expand:\n{terms_list}"),
+    ])
+
+    raw = (prompt | llm).invoke({}).content.strip()
+
+    # Parse JSON object from response
+    m = re.search(r'\{.*\}', raw, re.DOTALL)
+    if m:
+        try:
+            parsed: dict = json.loads(m.group())
+            result: dict[str, list[str]] = {}
+            for term in terms:
+                # Use LLM variants if available, else fall back to term alone
+                variants = parsed.get(term, [term])
+                # Ensure the original term is always first
+                if term not in variants:
+                    variants = [term] + variants
+                result[term] = [v for v in variants if isinstance(v, str) and v.strip()]
+            return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Fallback: no expansion
+    return {term: [term] for term in terms}
+
+
 # ── Per-term retrieval ────────────────────────────────────────────────────────
 
 def retrieve_for_term(
     term: str,
     index: DocumentIndex,
     top_k: int = 5,
+    extra_variants: list[str] | None = None,
 ) -> list[tuple[Document, float]]:
     """
-    Retrieve the most relevant chunks for a single term.
+    Retrieve the most relevant chunks for a single term using three layers:
 
-    Combines:
-    - Semantic similarity search (embedding-based)
-    - Heading keyword injection (exact heading match → score=1.0)
+    1. Semantic search — embedding similarity for the term and any expanded
+       variants (e.g. "SONIA" + "Sterling Overnight Index Average").
 
-    Returns (doc, score) pairs, deduplicated by chunk_id, highest score wins.
+    2. Heading keyword injection — if the term (or any variant) appears
+       verbatim in a chunk's heading, that chunk is included at score=1.0
+       regardless of its embedding similarity.
+
+    3. Body text keyword injection — if the term (or any variant) appears
+       verbatim anywhere in the chunk body, that chunk is included at
+       score=0.82. This catches acronyms, rate names, and specific figures
+       that embed poorly but appear literally in the document.
+
+    Priority order when the same chunk is matched by multiple layers:
+       heading match (1.0) > body match (0.82) > semantic score
+
+    Returns (doc, score) pairs, deduplicated by chunk_id.
     """
     seen: dict[int, tuple[Document, float]] = {}
 
-    for doc, score in index.vector_store.similarity_search_with_score(term, k=top_k):
-        cid = doc.metadata["chunk_id"]
-        if cid not in seen or score > seen[cid][1]:
-            seen[cid] = (doc, score)
+    # All search strings: original term + any expanded variants
+    search_variants = [term]
+    if extra_variants:
+        search_variants += [v for v in extra_variants if v != term]
 
-    term_lower = term.lower()
+    # ── Layer 1: Semantic search for all variants ─────────────────────────────
+    for variant in search_variants:
+        for doc, score in index.vector_store.similarity_search_with_score(variant, k=top_k):
+            cid = doc.metadata["chunk_id"]
+            if cid not in seen or score > seen[cid][1]:
+                seen[cid] = (doc, score)
+
+    # ── Layers 2 & 3: Keyword injection over all chunks ───────────────────────
+    variant_lowers = [v.lower() for v in search_variants]
+
     for chunk in index.chunks:
-        if term_lower in chunk.heading.lower() and chunk.chunk_id not in seen:
-            seen[chunk.chunk_id] = (chunk_to_doc(chunk), 1.0)
+        cid = chunk.chunk_id
+        heading_lower = chunk.heading.lower()
+        content_lower = chunk.content.lower()
+
+        heading_hit = any(v in heading_lower for v in variant_lowers)
+        body_hit    = any(v in content_lower for v in variant_lowers)
+
+        if heading_hit:
+            # Heading match always wins — override even a good semantic score
+            if cid not in seen or seen[cid][1] < HEADING_MATCH_SCORE:
+                seen[cid] = (chunk_to_doc(chunk), HEADING_MATCH_SCORE)
+
+        elif body_hit:
+            # Body match: inject only if semantic search missed it entirely,
+            # OR if the semantic score was below the body match score
+            # (e.g. semantic returned 0.2 — below threshold — body lifts it to 0.82)
+            if cid not in seen or seen[cid][1] < BODY_MATCH_SCORE:
+                seen[cid] = (chunk_to_doc(chunk), BODY_MATCH_SCORE)
 
     return list(seen.values())
 
@@ -112,6 +245,10 @@ def gather_all_relevant(
     index: DocumentIndex,
     top_k_per_term: int = 5,
     score_threshold: float = 0.35,
+    expand: bool = True,
+    llm_model: str = "gemma3-27b-it",
+    base_url: str = "http://localhost:11434/v1",
+    api_key: str = "ollama",
 ) -> list[tuple[Document, float, list[str]]]:
     """
     Run per-term retrieval for every extracted term, merge results, and apply
@@ -122,14 +259,39 @@ def gather_all_relevant(
     from the statement — e.g. a clause that defines both 'Final Maturity Date'
     and 'Extension Option' ranks higher than one that only defines one.
 
+    Parameters
+    ----------
+    expand : bool (default True)
+        If True, run a term expansion pass before retrieval. This generates
+        full-form variants for acronyms and abbreviations (e.g. SONIA →
+        Sterling Overnight Index Average) and searches for all variants.
+        Costs one extra LLM call but significantly improves recall for
+        financial/legal shorthand. Set to False to skip for speed.
+
     Returns a list of (doc, boosted_score, matched_terms) sorted by
     boosted_score descending.
     """
+    # Optional term expansion: generate synonyms / full forms
+    term_variants: dict[str, list[str]] = {}
+    if expand:
+        term_variants = expand_terms(
+            terms, llm_model=llm_model, base_url=base_url, api_key=api_key,
+        )
+        expanded_labels = {
+            t: vs for t, vs in term_variants.items() if vs != [t]
+        }
+        if expanded_labels:
+            print(f"      → Term expansions: {expanded_labels}")
+
     # chunk_id → (doc, best_raw_score, [matched terms])
     merged: dict[int, tuple[Document, float, list[str]]] = {}
 
     for term in terms:
-        for doc, score in retrieve_for_term(term, index, top_k=top_k_per_term):
+        variants = term_variants.get(term, [term]) if expand else [term]
+
+        for doc, score in retrieve_for_term(
+            term, index, top_k=top_k_per_term, extra_variants=variants,
+        ):
             if score < score_threshold:
                 continue
             cid = doc.metadata["chunk_id"]
@@ -266,6 +428,7 @@ def run_collate(
     index: DocumentIndex,
     statement: str,
     synthesize_result: bool = False,
+    expand_terms: bool = True,
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
@@ -277,16 +440,24 @@ def run_collate(
     Collate evidence for a free-text statement from a pre-built DocumentIndex.
 
     1. LLM extracts key terms from the statement.
-    2. Per-term retrieval: semantic search + heading keyword injection.
-    3. Multi-term boost (score × √N) + threshold filter.
-    4. Group by section, sort by page, build structured context.
-    5. Optionally, run LLM synthesis to verify and enrich the statement.
+    2. (Optional) Term expansion: generate full forms for acronyms/abbreviations
+       so that e.g. "SONIA" also searches "Sterling Overnight Index Average".
+    3. Per-term retrieval:
+       - Semantic similarity search (dense embeddings)
+       - Heading keyword injection  (score = 1.00)
+       - Body text keyword injection (score = 0.82) ← catches acronyms/figures
+    4. Multi-term boost (score × √N) + threshold filter.
+    5. Group by section, sort by page, build structured context.
+    6. Optionally, run LLM synthesis to verify and enrich the statement.
 
     Args:
         index:             Pre-built DocumentIndex (call DocumentIndex.from_pdf first).
         statement:         Free-text description referencing terms scattered
                            across multiple sections.
         synthesize_result: If True, run a final LLM synthesis pass.
+        expand_terms:      If True (default), run term expansion to generate full
+                           forms of acronyms and abbreviations before retrieval.
+                           Costs one extra LLM call; disable for speed.
         top_k_per_term:    Chunks retrieved per extracted term (default 5).
         score_threshold:   Min similarity score to include a chunk (default 0.35).
         max_chunks:        Cap on chunks in the collated context (default 25).
@@ -302,6 +473,10 @@ def run_collate(
         terms, index,
         top_k_per_term=top_k_per_term,
         score_threshold=score_threshold,
+        expand=expand_terms,
+        llm_model=llm_model,
+        base_url=base_url,
+        api_key=api_key,
     )
     print(f"      → {len(ranked)} unique chunks matched")
 
