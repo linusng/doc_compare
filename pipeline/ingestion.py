@@ -188,6 +188,59 @@ def filter_toc_blocks(
     return [b for b in blocks if b.page not in toc_pages]
 
 
+# ── Step 2b: Repeating block filter (headers / footers) ───────────────────────
+
+def filter_repeating_blocks(
+    blocks: list[TextBlock],
+    min_pages: int = 4,
+    max_text_len: int = 120,
+) -> list[TextBlock]:
+    """
+    Remove blocks whose text repeats across many pages — these are page
+    headers, footers, running titles, and page numbers that PyMuPDF returns
+    as ordinary blocks on every page.
+
+    A block is considered a repeating artefact when:
+    - Its normalised text is identical across ≥ min_pages pages, AND
+    - Its text is short (≤ max_text_len chars) — real content doesn't repeat
+      verbatim across many pages.
+
+    Parameters
+    ----------
+    min_pages    : Minimum number of pages a text must appear on to be
+                   considered a repeating artefact (default 4).  Set higher
+                   for shorter documents where 4 pages is a lot.
+    max_text_len : Only consider short blocks as candidates.  Long blocks
+                   (tables, definitions) are never artefacts (default 120).
+    """
+    from collections import Counter
+
+    # Count how many distinct pages each normalised text appears on
+    text_page_pairs: set[tuple[str, int]] = set()
+    for b in blocks:
+        normalised = " ".join(b.text.split())   # collapse whitespace
+        if normalised and len(normalised) <= max_text_len:
+            text_page_pairs.add((normalised, b.page))
+
+    # text → number of distinct pages it appears on
+    page_counts: Counter[str] = Counter()
+    for text, _ in text_page_pairs:
+        page_counts[text] += 1
+
+    repeating: set[str] = {
+        text for text, count in page_counts.items() if count >= min_pages
+    }
+
+    if repeating:
+        samples = sorted(repeating)[:5]
+        print(f"      → Suppressed {len(repeating)} repeating header/footer block(s): {samples}")
+
+    return [
+        b for b in blocks
+        if " ".join(b.text.split()) not in repeating
+    ]
+
+
 # ── Step 3: Heading detection and section chunking ────────────────────────────
 
 def _get_heading_level(text: str) -> int:
@@ -201,14 +254,47 @@ def _get_heading_level(text: str) -> int:
     return len([p for p in m.group(1).split(".") if p])
 
 
+# Minimum characters a block must have to qualify as a heading.
+# Blocks like "4", "•", or "Move To" are far too short to be real section
+# headings — they are artefacts from page numbers, bullet markers, or
+# navigation labels that survive the repeating-block filter because they
+# appear on fewer than min_pages pages.
+_MIN_HEADING_CHARS = 4
+
+# A heading must contain at least this many letters (not just digits/symbols).
+# This catches pure page numbers ("42"), roman numerals ("IV"), and lone
+# punctuation marks that bold formatting makes look like headings.
+_MIN_HEADING_LETTERS = 2
+
+
+def _is_valid_heading_text(text: str) -> bool:
+    """
+    Return True only if `text` looks like a genuine section heading.
+
+    Rejects:
+    - Strings shorter than _MIN_HEADING_CHARS characters
+    - Strings with fewer than _MIN_HEADING_LETTERS alphabetic characters
+      (pure numbers, page numbers, symbols)
+    - Strings that are purely numeric after stripping whitespace/punctuation
+    """
+    stripped = text.strip()
+    if len(stripped) < _MIN_HEADING_CHARS:
+        return False
+    letter_count = sum(1 for c in stripped if c.isalpha())
+    if letter_count < _MIN_HEADING_LETTERS:
+        return False
+    return True
+
+
 def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
     """
-    Mark blocks as headings based on font size and boldness.
-    Language-agnostic — works on any script.
+    Mark blocks as headings based on font size and boldness, with a validity
+    guard that prevents artefacts from being promoted to headings.
 
-    A block is a heading if:
-    - Its font size exceeds 1.1× the document median, OR
-    - It is bold and short (< 120 characters).
+    A block is a heading if ALL of:
+    - It passes _is_valid_heading_text (minimum length and letter count), AND
+    - Its font size exceeds 1.1× the document median,
+      OR it is bold and short (< 120 characters).
     """
     font_sizes = [b.font_size for b in blocks if b.font_size > 0]
     if not font_sizes:
@@ -217,10 +303,11 @@ def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
     median_size = statistics.median(font_sizes)
     updated = []
     for block in blocks:
-        is_heading = (
+        visually_a_heading = (
             block.font_size > median_size * 1.1
             or (block.is_bold and len(block.text) < 120)
         )
+        is_heading = visually_a_heading and _is_valid_heading_text(block.text)
         updated.append(pydantic_copy(block, {"is_heading": is_heading}))
     return updated
 
@@ -265,6 +352,57 @@ def chunk_by_section(blocks: list[TextBlock]) -> list[SectionChunk]:
         chunks.append(saved)
 
     return chunks
+
+
+# ── Step 3b: Short chunk filter ───────────────────────────────────────────────
+
+# Minimum number of characters the body content of a chunk must have.
+# A chunk whose entire body is shorter than this is almost certainly an
+# artefact: a stray bold label, a misdetected heading that captured nothing,
+# or a navigation element that slipped through.
+#
+# Typical real sections have body content in the hundreds of characters.
+# Setting this to 30 removes clear junk while preserving all real content,
+# including very short clauses like "Not applicable." or "See Schedule 2."
+_MIN_BODY_CHARS = 30
+
+
+def filter_short_chunks(
+    chunks: list[SectionChunk],
+    min_body_chars: int = _MIN_BODY_CHARS,
+) -> list[SectionChunk]:
+    """
+    Remove chunks whose body content is below min_body_chars characters.
+
+    These are almost always indexing artefacts:
+    - A bold page number was misdetected as a heading → chunk body is empty.
+    - A navigation label ("Move To") was misdetected as a heading → body is
+      whatever text followed before the next real heading (often nothing).
+
+    Chunks that pass the heading validity test but genuinely have no body
+    content — e.g. a section heading immediately followed by a sub-section —
+    are intentionally kept only if they have a proper section number prefix,
+    since those carry structural meaning even when empty.
+    """
+    kept = []
+    removed_labels = []
+
+    for chunk in chunks:
+        body_chars = len(chunk.content.strip())
+        has_section_number = bool(re.match(r'^\d+', chunk.heading.strip()))
+
+        if body_chars >= min_body_chars:
+            kept.append(chunk)
+        elif has_section_number and body_chars > 0:
+            # Keep short-but-not-empty numbered sections (structural markers)
+            kept.append(chunk)
+        else:
+            removed_labels.append(repr(chunk.heading[:40]))
+
+    if removed_labels:
+        print(f"      → Removed {len(removed_labels)} near-empty chunk(s): {removed_labels[:5]}")
+
+    return kept
 
 
 # ── Step 4: Token-safe splitting ──────────────────────────────────────────────
@@ -390,15 +528,18 @@ class DocumentIndex:
         blocks = extract_structured_blocks(pdf_path)
         print(f"      → {len(blocks)} blocks extracted")
 
-        print("[2/5] Filtering TOC pages...")
+        print("[2/5] Filtering TOC pages & repeating artefacts...")
         blocks = filter_toc_blocks(
             blocks, llm_model=llm_model, base_url=base_url, api_key=api_key,
         )
-        print(f"      → {len(blocks)} blocks after TOC filter")
+        blocks = filter_repeating_blocks(blocks)
+        print(f"      → {len(blocks)} blocks after filtering")
 
         print("[3/5] Chunking by section...")
         chunks = chunk_by_section(blocks)
-        print(f"      → {len(chunks)} sections found")
+        print(f"      → {len(chunks)} raw sections found")
+        chunks = filter_short_chunks(chunks)
+        print(f"      → {len(chunks)} sections after removing near-empty chunks")
 
         print("[4/5] Splitting oversized chunks...")
         chunks = split_oversized_chunks(chunks)
