@@ -12,11 +12,22 @@ What this stage does
 `run_collate` casts a wide net — it retrieves every FA passage whose terms
 overlap with the CP value.  Not all of them are directly relevant.
 
-`extract_evidence` collapses that list.  Given the CP value and the candidate
-passages, the LLM selects only those passages that most closely and directly
-address what the CP value is describing.  Everything else is dropped.
+`extract_evidence` collapses that list in two layers:
 
-The result is a short, clean list of FA passages ready for the comparison agent.
+  Layer 1 — Keyword pre-selection (guaranteed)
+    Scan each candidate's text for exact occurrences of the key terms that
+    were extracted from the CP value during collation.  Any passage that
+    contains a key term verbatim is guaranteed to be included — it cannot
+    be dropped by the LLM.  This ensures that passages containing "SONIA",
+    "GBP", or specific figures are never missed.
+
+  Layer 2 — LLM selection (additive)
+    The LLM reads all candidates and selects any additional passages it
+    judges relevant that the keyword pass may have missed (e.g. passages
+    that rephrase a concept without using the exact term).
+
+The final result is the union of both layers, keyword-matched passages
+listed first (highest priority), then any LLM-only additions.
 
 Python API
 ----------
@@ -46,21 +57,73 @@ class ExtractedEvidence(BaseModel):
     """
     Filtered evidence for one CP field.
 
-    selected_sections : the subset of CollatedResult.evidence that the LLM
-                        judged directly relevant to the CP value.
-    filtered_context  : formatted string ready for the comparison agent.
+    selected_sections    : the subset of CollatedResult.evidence kept as relevant.
+                           Keyword-matched sections appear first.
+    keyword_matched_count: how many sections were kept by the keyword pass.
+    llm_added_count      : how many additional sections were added by the LLM.
+    dropped_count        : how many candidates were filtered out entirely.
+    filtered_context     : formatted string ready for the comparison agent.
     """
     cp_field: str
     cp_value: str
-    selected_sections: list    # list[SectionEvidence] — kept passages
-    dropped_count: int         # how many candidates were filtered out
-    filtered_context: str      # clean context for analyze_deviation
+    selected_sections: list       # list[SectionEvidence]
+    keyword_matched_count: int
+    llm_added_count: int
+    dropped_count: int
+    filtered_context: str
+
+
+# ── Keyword pre-selection ─────────────────────────────────────────────────────
+
+# Terms shorter than this are too generic to be reliable keyword signals
+# (e.g. "or", "at", "of").  Raise to exclude short financial abbreviations
+# like "pa" if they cause false positives; lower to catch e.g. "USD".
+_MIN_TERM_CHARS = 3
+
+
+def _keyword_preselect(
+    candidates: list[SectionEvidence],
+    terms: list[str],
+) -> tuple[list[int], list[int]]:
+    """
+    Scan each candidate section (heading + excerpt) for exact, case-insensitive
+    occurrences of any key term.
+
+    Returns
+    -------
+    (matched_indices, unmatched_indices)
+        matched_indices   — positions in `candidates` that contain at least one term
+        unmatched_indices — positions that contain none of the terms
+    """
+    # Build the set of meaningful search tokens from the extracted terms.
+    # Each multi-word term is also split into its constituent words so that
+    # e.g. "Final Maturity Date" matches a passage containing just "Maturity Date".
+    token_set: set[str] = set()
+    for term in terms:
+        term = term.strip()
+        if len(term) >= _MIN_TERM_CHARS:
+            token_set.add(term.lower())
+        for word in term.split():
+            if len(word) >= _MIN_TERM_CHARS:
+                token_set.add(word.lower())
+
+    matched: list[int] = []
+    unmatched: list[int] = []
+
+    for i, sec in enumerate(candidates):
+        searchable = (sec.heading + " " + sec.excerpt).lower()
+        if any(token in searchable for token in token_set):
+            matched.append(i)
+        else:
+            unmatched.append(i)
+
+    return matched, unmatched
 
 
 # ── Prompt helpers ────────────────────────────────────────────────────────────
 
 def _format_candidates(
-    evidence: list[SectionEvidence],
+    candidates: list[SectionEvidence],
     max_chars_per_section: int = 1000,
 ) -> str:
     """
@@ -68,7 +131,7 @@ def _format_candidates(
     Each entry shows the section heading, pages, and a truncated excerpt.
     """
     parts = []
-    for i, sec in enumerate(evidence):
+    for i, sec in enumerate(candidates):
         excerpt = sec.excerpt.strip()
         if len(excerpt) > max_chars_per_section:
             excerpt = excerpt[:max_chars_per_section] + "\n[… truncated]"
@@ -111,30 +174,38 @@ def extract_evidence(
     max_chars_per_section: int = 1000,
 ) -> ExtractedEvidence:
     """
-    Given the CP value and the candidate FA passages from run_collate,
-    select only those passages that are most directly relevant.
+    Collapse the collated FA candidate passages down to those most directly
+    relevant to the CP value, using a two-layer approach:
 
-    The LLM reads each candidate and picks the indices of the ones that
-    closely and directly address what the CP value describes.  All others
-    are dropped.
+    Layer 1 — Keyword pre-selection (guaranteed inclusion)
+        Any passage whose text contains a key term from the CP value is
+        automatically included.  This is a hard guarantee — the LLM cannot
+        drop these.  Handles exact financial terms like "SONIA", "GBP",
+        specific figures, and defined terms.
+
+    Layer 2 — LLM selection (additive)
+        The LLM reads all candidates and identifies any further relevant
+        passages that the keyword pass may have missed.  Its selections are
+        added to the keyword-matched set; it cannot remove them.
 
     Parameters
     ----------
     cp_field              : CP form field name, e.g. "Margin".
     cp_value              : CP form value, e.g. "GBP: SONIA + 0.8% p.a.".
     collated              : CollatedResult from run_collate().
-    max_chars_per_section : Max characters shown per candidate in the prompt.
-                            Increase if relevant text is being cut off.
+    max_chars_per_section : Max characters shown per candidate in the LLM prompt.
 
     Returns
     -------
-    ExtractedEvidence with selected_sections and filtered_context.
+    ExtractedEvidence
     """
     if not collated.evidence:
         return ExtractedEvidence(
             cp_field=cp_field,
             cp_value=cp_value,
             selected_sections=[],
+            keyword_matched_count=0,
+            llm_added_count=0,
             dropped_count=0,
             filtered_context="(No FA passages were retrieved for this CP field.)",
         )
@@ -142,73 +213,97 @@ def extract_evidence(
     candidates: list[SectionEvidence] = collated.evidence
     n = len(candidates)
 
-    candidates_text = _format_candidates(
-        candidates, max_chars_per_section=max_chars_per_section,
-    )
+    # ── Layer 1: Keyword pre-selection ────────────────────────────────────────
+    # Use the key terms that run_collate already extracted — these are the
+    # precise legal/financial terms from the CP value.
+    terms = collated.terms_extracted
 
-    llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
+    keyword_indices, remaining_indices = _keyword_preselect(candidates, terms)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", (
-            "You are reviewing candidate passages retrieved from a facility agreement.\n\n"
-            "Your task: given a CP form value, select the passages from the list below "
-            "that are most closely and directly relevant to it.\n\n"
-            "A passage is relevant if it:\n"
-            "  - Directly defines, states, or governs what the CP value describes\n"
-            "  - Contains the specific rate, amount, date, condition, or mechanism "
-            "referenced in the CP value\n\n"
-            "A passage is NOT relevant if it:\n"
-            "  - Only mentions a related term in passing\n"
-            "  - Covers a different clause or topic that happens to share a keyword\n"
-            "  - Is general boilerplate with no specific bearing on the CP value\n\n"
-            "Respond with ONLY the index numbers of the relevant passages, "
-            "comma-separated, most relevant first.\n"
-            "Example: 2,0,4\n"
-            "If none of the passages are relevant, respond with: NONE"
-        )),
-        ("human", (
-            "CP FIELD : {cp_field}\n"
-            "CP VALUE : {cp_value}\n\n"
-            "CANDIDATE PASSAGES ({n} total):\n\n"
-            "{candidates}"
-        )),
-    ])
+    keyword_matched = [candidates[i] for i in keyword_indices]
+    keyword_set = set(keyword_indices)
 
-    raw = (prompt | llm).invoke({
-        "cp_field":   cp_field,
-        "cp_value":   cp_value,
-        "n":          n,
-        "candidates": candidates_text,
-    }).content.strip()
+    print(f"         → Keyword pre-selected {len(keyword_matched)}/{n} passage(s): "
+          f"{[candidates[i].heading for i in keyword_indices]}")
 
-    # ── Parse the response ────────────────────────────────────────────────────
-    selected: list[SectionEvidence] = []
+    # ── Layer 2: LLM selection over ALL candidates ────────────────────────────
+    # Show the LLM the full candidate list so it has the complete picture.
+    # Its role is to find passages the keyword pass missed — its selections
+    # are added on top of the keyword matches, never replacing them.
+    llm_added: list[SectionEvidence] = []
 
-    if raw.upper() != "NONE":
-        seen: set[int] = set()
-        for token in re.findall(r'\d+', raw):
-            idx = int(token)
-            if 0 <= idx < n and idx not in seen:
-                selected.append(candidates[idx])
-                seen.add(idx)
+    if remaining_indices:   # only call LLM if there are non-keyword candidates to judge
+        candidates_text = _format_candidates(candidates, max_chars_per_section)
 
-    dropped = n - len(selected)
-    filtered_context = _render_filtered_context(selected)
-
-    # Fallback: if the LLM selected nothing or gave an unparseable response,
-    # keep all candidates so the comparison agent is never left empty-handed.
-    if not selected:
-        filtered_context = (
-            "[No passages were selected — returning all candidates as fallback]\n\n"
-            + _render_filtered_context(candidates)
+        llm = ChatOpenAI(
+            model=llm_model, base_url=base_url, api_key=api_key, temperature=0,
         )
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", (
+                "You are reviewing candidate passages retrieved from a facility agreement.\n\n"
+                "Your task: given a CP form value, identify passages from the list below "
+                "that are most closely and directly relevant to it.\n\n"
+                "A passage is relevant if it:\n"
+                "  - Directly defines, states, or governs what the CP value describes\n"
+                "  - Contains the specific rate, amount, date, condition, or mechanism "
+                "referenced in the CP value\n\n"
+                "A passage is NOT relevant if it:\n"
+                "  - Only mentions a related term in passing or in a different context\n"
+                "  - Covers a different clause or topic that happens to share a keyword\n"
+                "  - Is general boilerplate with no specific bearing on the CP value\n\n"
+                "Note: some passages have already been selected by a keyword match and "
+                "will be included regardless. Focus on identifying any ADDITIONAL passages "
+                "you judge relevant that may have been missed.\n\n"
+                "Respond with ONLY the index numbers of relevant passages, "
+                "comma-separated, most relevant first.\n"
+                "Example: 2,0,4\n"
+                "If none of the remaining passages are relevant, respond with: NONE"
+            )),
+            ("human", (
+                "CP FIELD : {cp_field}\n"
+                "CP VALUE : {cp_value}\n\n"
+                "CANDIDATE PASSAGES ({n} total):\n\n"
+                "{candidates}"
+            )),
+        ])
+
+        raw = (prompt | llm).invoke({
+            "cp_field":   cp_field,
+            "cp_value":   cp_value,
+            "n":          n,
+            "candidates": candidates_text,
+        }).content.strip()
+
+        if raw.upper() != "NONE":
+            seen_llm: set[int] = set()
+            for token in re.findall(r'\d+', raw):
+                idx = int(token)
+                if 0 <= idx < n and idx not in keyword_set and idx not in seen_llm:
+                    llm_added.append(candidates[idx])
+                    seen_llm.add(idx)
+
+        print(f"         → LLM added {len(llm_added)} further passage(s): "
+              f"{[s.heading for s in llm_added]}")
+
+    # ── Merge: keyword-matched first, then LLM additions ─────────────────────
+    selected = keyword_matched + llm_added
+    dropped = n - len(selected)
+
+    # Fallback: if both layers returned nothing, keep all candidates.
+    if not selected:
+        print("         → Both layers returned nothing — keeping all candidates as fallback")
         selected = candidates
         dropped = 0
+
+    filtered_context = _render_filtered_context(selected)
 
     return ExtractedEvidence(
         cp_field=cp_field,
         cp_value=cp_value,
         selected_sections=selected,
+        keyword_matched_count=len(keyword_matched),
+        llm_added_count=len(llm_added),
         dropped_count=dropped,
         filtered_context=filtered_context,
     )
