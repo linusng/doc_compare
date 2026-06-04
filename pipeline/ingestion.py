@@ -383,15 +383,23 @@ def filter_short_chunks(
     content — e.g. a section heading immediately followed by a sub-section —
     are intentionally kept only if they have a proper section number prefix,
     since those carry structural meaning even when empty.
+
+    Note: the size test is applied to the chunk's FULL text (heading + body),
+    not the body alone.  In legal documents a defined term is often bold, which
+    causes the entire definition line (e.g. '"Margin" means 0.80 per cent. per
+    annum.') to be promoted to a heading with an empty body.  Measuring the
+    body alone would wrongly drop these — the content lives in the heading.
     """
     kept = []
     removed_labels = []
 
     for chunk in chunks:
         body_chars = len(chunk.content.strip())
+        total_chars = len(chunk.full_text.strip())   # heading + body
         has_section_number = bool(re.match(r'^\d+', chunk.heading.strip()))
 
-        if body_chars >= min_body_chars:
+        if total_chars >= min_body_chars:
+            # Enough text anywhere in the chunk (heading or body) to be real.
             kept.append(chunk)
         elif has_section_number and body_chars > 0:
             # Keep short-but-not-empty numbered sections (structural markers)
