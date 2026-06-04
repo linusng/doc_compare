@@ -79,18 +79,82 @@ def extract_key_terms(
 # Dense embeddings handle meaning well but are weak on exact short tokens:
 # acronyms (SONIA, EURIBOR), currency codes (GBP, USD), specific figures
 # (0.8%, 50,000,000).  Keyword injection bypasses the embedding entirely for
-# these cases, assigning a fixed "guaranteed inclusion" score.
+# these cases, assigning a "guaranteed inclusion" score.
+#
+# Two refinements over a naive substring scan:
+#
+#   (1) Word-boundary matching.  "rate" must not match inside "corporate",
+#       "interest" must not match inside "interested".  Matching is anchored
+#       so the term cannot be embedded inside a larger alphanumeric word.
+#
+#   (2) Specificity- and density-weighted body scoring.  A high-specificity
+#       token (acronym, currency code, figure, punctuated abbreviation, or
+#       multi-word phrase) is guaranteed at BODY_MATCH_SCORE even on a single
+#       occurrence — these are exactly the tokens we cannot afford to miss.
+#       A generic single word (e.g. "interest", "facility") earns only a low
+#       score on a single passing mention and climbs with each extra
+#       occurrence; one stray mention now scores below the default threshold
+#       and is dropped instead of flooding the candidate list.
 #
 # Score hierarchy:
-#   Heading match  1.00  — term appears in the section heading itself
-#   Body match     0.82  — term appears verbatim in the chunk body text
-#   Semantic hit   varies — embedding similarity (typically 0.35 – 0.95)
-#
-# Body match is set below 1.0 so that a chunk whose heading exactly names
-# the term still outranks one that only mentions it in passing.
+#   Heading match     1.00      — term appears (whole-word) in the heading
+#   Specific body     0.82      — specific token appears in the body
+#   Generic body      0.30–0.78 — generic word, scaled by occurrence count
+#   Semantic hit      varies    — embedding similarity (typically 0.35 – 0.95)
 
 HEADING_MATCH_SCORE = 1.00
-BODY_MATCH_SCORE    = 0.82
+BODY_MATCH_SCORE    = 0.82   # specific token found verbatim in the body
+
+# Graded body scores for generic (low-specificity) single words, by count.
+_GENERIC_BODY_BASE = 0.30    # one passing mention — below default 0.35 threshold
+_GENERIC_BODY_STEP = 0.18    # added per additional occurrence
+_GENERIC_BODY_CAP  = 0.78    # never reaches specific/heading level
+
+
+def _is_specific_token(variant: str) -> bool:
+    """
+    A token is "specific" when a single verbatim occurrence is strong enough
+    evidence to guarantee inclusion:
+
+      - multi-word phrases     ("Final Maturity Date", "pound sterling")
+      - tokens containing digits ("0.8%", "50,000,000")
+      - punctuated abbreviations ("p.a.", "and/or")
+      - all-caps acronyms / currency codes ≥ 2 chars ("SONIA", "GBP", "USD")
+
+    Everything else (plain lowercase words like "interest", "facility") is
+    generic and must earn its score through repetition.
+    """
+    v = variant.strip()
+    if not v:
+        return False
+    if " " in v:                                  # multi-word phrase
+        return True
+    if any(ch.isdigit() for ch in v):             # figures / percentages
+        return True
+    if any(ch in v for ch in ".%/&-"):            # p.a., and/or, year-on-year
+        return True
+    if v.isupper() and len(v) >= 2:               # acronyms, currency codes
+        return True
+    return False
+
+
+def _boundary_pattern(variant: str) -> re.Pattern:
+    """
+    Compile a case-insensitive, word-boundary matcher for `variant`.
+
+    Uses alphanumeric lookarounds rather than \\b so that punctuated tokens
+    ("p.a.", "0.8%") still anchor correctly: the token may be flanked by
+    spaces or punctuation, but never embedded inside a larger word/number.
+    """
+    return re.compile(
+        rf'(?<![A-Za-z0-9]){re.escape(variant)}(?![A-Za-z0-9])',
+        re.IGNORECASE,
+    )
+
+
+def _generic_body_score(count: int) -> float:
+    """Map a generic-word occurrence count to a graded body score."""
+    return min(_GENERIC_BODY_BASE + _GENERIC_BODY_STEP * (count - 1), _GENERIC_BODY_CAP)
 
 
 # ── Term expansion ────────────────────────────────────────────────────────────
@@ -184,17 +248,22 @@ def retrieve_for_term(
     1. Semantic search — embedding similarity for the term and any expanded
        variants (e.g. "SONIA" + "Sterling Overnight Index Average").
 
-    2. Heading keyword injection — if the term (or any variant) appears
-       verbatim in a chunk's heading, that chunk is included at score=1.0
+    2. Heading keyword injection — if the term (or any variant) appears as a
+       whole word in a chunk's heading, that chunk is included at score=1.0
        regardless of its embedding similarity.
 
-    3. Body text keyword injection — if the term (or any variant) appears
-       verbatim anywhere in the chunk body, that chunk is included at
-       score=0.82. This catches acronyms, rate names, and specific figures
-       that embed poorly but appear literally in the document.
+    3. Body text keyword injection — whole-word occurrences in the chunk body
+       are scored by token specificity and density:
+         - a specific token (acronym, figure, currency code, phrase) scores
+           BODY_MATCH_SCORE on a single occurrence;
+         - a generic word scores low on one passing mention and climbs with
+           each extra occurrence (see _generic_body_score).
+       This still catches acronyms / rate names / figures that embed poorly,
+       while preventing a single stray mention of a common word from flooding
+       the candidate list.
 
     Priority order when the same chunk is matched by multiple layers:
-       heading match (1.0) > body match (0.82) > semantic score
+       heading match (1.0) > specific body (0.82) > generic body > semantic
 
     Returns (doc, score) pairs, deduplicated by chunk_id.
     """
@@ -212,28 +281,48 @@ def retrieve_for_term(
             if cid not in seen or score > seen[cid][1]:
                 seen[cid] = (doc, score)
 
-    # ── Layers 2 & 3: Keyword injection over all chunks ───────────────────────
-    variant_lowers = [v.lower() for v in search_variants]
+    # ── Layers 2 & 3: Whole-word keyword injection over all chunks ─────────────
+    # Precompile a boundary matcher per variant and record its specificity once.
+    matchers: list[tuple[re.Pattern, bool]] = [
+        (_boundary_pattern(v), _is_specific_token(v)) for v in search_variants
+    ]
 
     for chunk in index.chunks:
         cid = chunk.chunk_id
-        heading_lower = chunk.heading.lower()
-        content_lower = chunk.content.lower()
+        heading = chunk.heading
+        content = chunk.content
 
-        heading_hit = any(v in heading_lower for v in variant_lowers)
-        body_hit    = any(v in content_lower for v in variant_lowers)
+        heading_hit = any(pat.search(heading) for pat, _ in matchers)
+
+        # Tally body occurrences, separating specific from generic tokens.
+        specific_body_hit = False
+        generic_body_count = 0
+        for pat, is_specific in matchers:
+            count = len(pat.findall(content))
+            if count:
+                if is_specific:
+                    specific_body_hit = True
+                else:
+                    generic_body_count += count
 
         if heading_hit:
-            # Heading match always wins — override even a good semantic score
+            # Whole-word heading match always wins — override semantic score.
             if cid not in seen or seen[cid][1] < HEADING_MATCH_SCORE:
                 seen[cid] = (chunk_to_doc(chunk), HEADING_MATCH_SCORE)
+            continue
 
-        elif body_hit:
-            # Body match: inject only if semantic search missed it entirely,
-            # OR if the semantic score was below the body match score
-            # (e.g. semantic returned 0.2 — below threshold — body lifts it to 0.82)
-            if cid not in seen or seen[cid][1] < BODY_MATCH_SCORE:
-                seen[cid] = (chunk_to_doc(chunk), BODY_MATCH_SCORE)
+        # Determine the body-injection score, if any.
+        if specific_body_hit:
+            body_score = BODY_MATCH_SCORE
+        elif generic_body_count > 0:
+            body_score = _generic_body_score(generic_body_count)
+        else:
+            body_score = None
+
+        if body_score is not None:
+            # Inject only if it beats whatever semantic score we already have.
+            if cid not in seen or seen[cid][1] < body_score:
+                seen[cid] = (chunk_to_doc(chunk), body_score)
 
     return list(seen.values())
 
