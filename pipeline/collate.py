@@ -400,6 +400,23 @@ def gather_all_relevant(
 
 # ── Context assembly ──────────────────────────────────────────────────────────
 
+def _has_specific_exact_match(doc: Document, terms: list[str]) -> bool:
+    """
+    True if the chunk contains a verbatim, whole-word occurrence of any
+    *specific* matched term (acronym, currency code, figure, punctuated
+    abbreviation, or multi-word phrase — see _is_specific_token).
+
+    These are near-certain relevant hits.  A single-term specific match
+    (e.g. "SOFR") earns no multi-term boost and can be ranked below fuzzy
+    multi-term chunks, so it must be protected from the max_chunks cutoff.
+    """
+    text = doc.page_content
+    for t in terms:
+        if _is_specific_token(t) and _boundary_pattern(t).search(text):
+            return True
+    return False
+
+
 def build_collated_context(
     ranked: list[tuple[Document, float, list[str]]],
     max_chunks: int = 25,
@@ -408,13 +425,34 @@ def build_collated_context(
     Group matched chunks by section heading, sort by page number, and
     render a structured context string ready for downstream LLM use.
 
+    Chunks that contain a verbatim specific token (e.g. "SOFR", "GBP", a
+    figure) are GUARANTEED inclusion regardless of max_chunks — a single
+    such match would otherwise be buried below fuzzy multi-term chunks by
+    the √N boost and dropped by the cutoff.  Remaining slots are filled by
+    boosted-score rank as before.
+
     Returns:
         combined_context      — formatted string
         evidence              — list[SectionEvidence]
         sections_referenced   — unique headings in page order
     """
+    # Partition: exact specific-token matches are guaranteed; the rest compete
+    # for the remaining slots by rank.  Both lists keep the incoming (sorted)
+    # order so ranking is preserved within each group.
+    guaranteed = [item for item in ranked if _has_specific_exact_match(item[0], item[2])]
+    rest       = [item for item in ranked if not _has_specific_exact_match(item[0], item[2])]
+
+    if len(guaranteed) >= max_chunks:
+        selected = guaranteed[:max_chunks]
+    else:
+        selected = guaranteed + rest[: max_chunks - len(guaranteed)]
+
+    if guaranteed:
+        headings = sorted({_base_heading(d.metadata.get("heading", "")) for d, _, _ in guaranteed})
+        print(f"      → {len(guaranteed)} guaranteed exact-token chunk(s): {headings}")
+
     by_section: dict[str, list] = defaultdict(list)
-    for doc, score, terms in ranked[:max_chunks]:
+    for doc, score, terms in selected:
         heading = _base_heading(doc.metadata.get("heading", "(no heading)"))
         by_section[heading].append((doc, score, terms))
 
