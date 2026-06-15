@@ -484,7 +484,10 @@ def filter_short_chunks(
     for chunk in chunks:
         body_chars = len(chunk.content.strip())
         total_chars = len(chunk.full_text.strip())   # heading + body
-        has_section_number = bool(re.match(r'^\d+', chunk.heading.strip()))
+        # Recognise structural markers across US/UK conventions — bare numbers
+        # ('1.0.1'), label-prefixed ('Section 1.0.1'), roman ('ARTICLE I'),
+        # and the section symbol ('§ 2.3') — via the shared parser.
+        has_section_number = _extract_section_number(chunk.heading) is not None
 
         if total_chars >= min_body_chars:
             # Enough text anywhere in the chunk (heading or body) to be real.
