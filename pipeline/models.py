@@ -21,6 +21,7 @@ class TextBlock(BaseModel):
     is_bold: bool
     block_no: int
     is_heading: bool = False
+    page_height: float = 0.0   # height of the source page, for margin detection
 
 
 class SectionChunk(BaseModel):

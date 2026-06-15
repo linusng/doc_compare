@@ -28,6 +28,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer
 
 from .models import SectionChunk, TextBlock, pydantic_copy
+from .section_utils import _extract_section_number
 
 
 # ── Tokeniser (BGE-M3) ────────────────────────────────────────────────────────
@@ -53,6 +54,7 @@ def extract_structured_blocks(pdf_path: str) -> list[TextBlock]:
 
     for page_num, page in enumerate(doc):
         page_dict = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)
+        page_height = float(page.rect.height)
 
         for block in page_dict["blocks"]:
             if block["type"] != 0:
@@ -78,6 +80,7 @@ def extract_structured_blocks(pdf_path: str) -> list[TextBlock]:
                     font_size=max_font_size,
                     is_bold=is_bold,
                     block_no=block["number"],
+                    page_height=page_height,
                 ))
 
     doc.close()
@@ -241,17 +244,102 @@ def filter_repeating_blocks(
     ]
 
 
+# ── Step 2c: Positional header / footer filter ────────────────────────────────
+
+def filter_positional_headers_footers(
+    blocks: list[TextBlock],
+    min_pages: int = 4,
+    top_frac: float = 0.08,
+    bottom_frac: float = 0.92,
+    max_text_len: int = 120,
+    band_buckets: int = 100,
+) -> list[TextBlock]:
+    """
+    Remove running headers/footers detected by POSITION rather than by text.
+
+    The text-based `filter_repeating_blocks` only catches blocks whose text is
+    identical across pages.  It misses running headers/footers whose text VARIES
+    per page — page numbers, dates, and (critically) running titles that name
+    the current clause (e.g. a bold "2 THE FACILITY" header appearing on a page
+    that still contains Definitions text).  Those varying blocks survive, get
+    promoted to headings, and split a section in two — which is why a long
+    section like Definitions can be cut off halfway.
+
+    A block is treated as a running header/footer when ALL of:
+      - it is short (≤ max_text_len chars) — body paragraphs are never headers,
+      - it sits in the top margin band (its bottom edge is above top_frac of the
+        page) OR the bottom margin band (its top edge is below bottom_frac), AND
+      - a block occupies that same margin + vertical position on ≥ min_pages
+        distinct pages.  Recurrence at a fixed position across pages is the
+        signature of a running element; a genuine one-off section heading does
+        not recur at the same band position on many pages.
+
+    Parameters
+    ----------
+    top_frac / bottom_frac : margin band thresholds as a fraction of page
+                             height.  Kept tight (top 8% / bottom 8%) so that
+                             real section headings, which sit in the body area,
+                             are not caught.
+    band_buckets           : vertical resolution for position matching (100 →
+                             buckets of 1% of page height).
+    """
+    from collections import Counter
+
+    def position_key(b: TextBlock) -> tuple[str, int] | None:
+        h = b.page_height
+        if h <= 0:
+            return None
+        y0, y1 = b.bbox[1], b.bbox[3]
+        center_frac = ((y0 + y1) / 2.0) / h
+        bucket = round(center_frac * band_buckets)
+        if y1 <= h * top_frac:
+            return ("top", bucket)
+        if y0 >= h * bottom_frac:
+            return ("bottom", bucket)
+        return None
+
+    # Count distinct pages per (side, vertical-bucket) for short margin blocks.
+    key_pages: dict[tuple[str, int], set[int]] = {}
+    for b in blocks:
+        if len(" ".join(b.text.split())) > max_text_len:
+            continue
+        key = position_key(b)
+        if key is not None:
+            key_pages.setdefault(key, set()).add(b.page)
+
+    running_keys = {k for k, pages in key_pages.items() if len(pages) >= min_pages}
+
+    if not running_keys:
+        print("      → No positional header/footer bands detected")
+        return blocks
+
+    kept: list[TextBlock] = []
+    removed_samples: list[str] = []
+    for b in blocks:
+        if len(" ".join(b.text.split())) <= max_text_len and position_key(b) in running_keys:
+            if len(removed_samples) < 5:
+                removed_samples.append(repr(b.text[:40]))
+            continue
+        kept.append(b)
+
+    print(f"      → Suppressed positional header/footer blocks "
+          f"({len(blocks) - len(kept)} block(s)); samples: {removed_samples}")
+    return kept
+
+
 # ── Step 3: Heading detection and section chunking ────────────────────────────
 
 def _get_heading_level(text: str) -> int:
     """
-    Infer heading depth from the section number prefix.
-    '1.' → 1,  '1.1' → 2,  '1.1.1' → 3,  no number → 0.
+    Infer heading depth from the section number prefix, using the shared
+    US/UK-aware number parser so e.g. 'Section 1.01' and 'ARTICLE I' are
+    levelled consistently.
+    '1.'/'ARTICLE I' → 1,  '1.1'/'Section 1.01' → 2,  '1.1.1' → 3,  none → 0.
     """
-    m = re.match(r'^(\d+(?:\.\d+)*)\s*\.?\s', text.strip())
-    if not m:
+    num = _extract_section_number(text)
+    if not num:
         return 0
-    return len([p for p in m.group(1).split(".") if p])
+    return len([p for p in num.split(".") if p])
 
 
 # Minimum characters a block must have to qualify as a heading.
@@ -541,6 +629,7 @@ class DocumentIndex:
             blocks, llm_model=llm_model, base_url=base_url, api_key=api_key,
         )
         blocks = filter_repeating_blocks(blocks)
+        blocks = filter_positional_headers_footers(blocks)
         print(f"      → {len(blocks)} blocks after filtering")
 
         print("[3/5] Chunking by section...")

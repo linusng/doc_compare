@@ -28,17 +28,72 @@ def _base_heading(heading: str) -> str:
     return re.sub(r'\s*\(part \d+\)\s*$', '', heading).strip()
 
 
+# Leading structural labels that precede a section number in many documents.
+# Word labels require a word boundary; the section symbol "§" does not.
+_LEADING_LABEL_RE = re.compile(
+    r'^(?:(?:sections?|articles?|clauses?|sec|art)\b|§)[\s.\-:]*',
+    re.IGNORECASE,
+)
+
+# A roman-numeral token at the start of the remaining text (Article I, II, IV …).
+_ROMAN_RE = re.compile(
+    r'^(M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))\b',
+    re.IGNORECASE,
+)
+
+# Articles/sections never run this high; caps roman false positives where a
+# title word happens to start with roman letters (e.g. "D…", "M…", "C…", "L…").
+_MAX_ROMAN_SECTION = 49
+
+
+def _roman_to_int(s: str) -> int:
+    vals = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+    total, prev = 0, 0
+    for ch in reversed(s.lower()):
+        v = vals[ch]
+        total = total - v if v < prev else total + v
+        prev = max(prev, v)
+    return total
+
+
 def _extract_section_number(heading: str) -> str | None:
     """
-    Return the leading section number from a heading.
+    Return the leading section number from a heading, normalised to a
+    dot-separated arabic string.  Handles UK *and* US numbering conventions:
 
-    '1.1 Definitions' → '1.1'
-    '19. Extension'   → '19'
-    'Schedule 2 ...'  → None  (handled by named-prefix logic instead)
+      '1.1 Definitions'              → '1.1'
+      '19. Extension'                → '19'
+      'Section 1.01 Definitions'     → '1.01'   (leading 'Section' stripped)
+      '§ 2.3 Interest'               → '2.3'     (section symbol stripped)
+      'ARTICLE I  DEFINITIONS'       → '1'       (roman numeral → 1)
+      'ARTICLE IV  THE LOANS'        → '4'
+      'Schedule 2 ...'               → None      (named-prefix logic handles it)
+
+    Roman numerals are only parsed when introduced by a label ('Article I'),
+    and only within a sane section range, so ordinary title words that begin
+    with roman letters ('Liabilities', 'Miscellaneous') are not misread.
     """
-    heading = _base_heading(heading)
-    m = re.match(r'^(\d+(?:\.\d+)*)\s*\.?\s', heading.strip())
-    return m.group(1) if m else None
+    h = _base_heading(heading).strip()
+
+    label = _LEADING_LABEL_RE.match(h)
+    had_label = bool(label)
+    if label:
+        h = h[label.end():].lstrip()
+
+    # Arabic decimal numbering: 1, 1.1, 1.01, 2.03, …
+    m = re.match(r'(\d+(?:\.\d+)*)', h)
+    if m:
+        return m.group(1)
+
+    # Roman numerals — only right after a structural label (Article / Section).
+    if had_label:
+        rm = _ROMAN_RE.match(h)
+        if rm and rm.group(1):
+            value = _roman_to_int(rm.group(1))
+            if 1 <= value <= _MAX_ROMAN_SECTION:
+                return str(value)
+
+    return None
 
 
 # ── Section hierarchy ─────────────────────────────────────────────────────────
