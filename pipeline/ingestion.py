@@ -34,8 +34,16 @@ from .section_utils import _extract_section_number
 # ── Tokeniser (BGE-M3) ────────────────────────────────────────────────────────
 
 _tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-m3")
-BGE_M3_MAX_TOKENS = 8192
+BGE_M3_MAX_TOKENS = 8192          # hard embedding-capacity ceiling
 BGE_M3_CHUNK_OVERLAP = 50
+
+# Retrieval-oriented target chunk size.  This is deliberately far below the
+# 8192-token embedding ceiling: embedding a very large section produces a
+# diluted, unfocused vector, so big sections (US "Defined Terms", long covenant
+# clauses, etc.) retrieve poorly as one blob.  Splitting them into ~this many
+# tokens keeps each vector focused and dramatically improves retrieval.
+# Tune via DocumentIndex.from_pdf(target_chunk_tokens=...).
+TARGET_CHUNK_TOKENS = 1000
 
 
 def token_len(text: str) -> int:
@@ -612,15 +620,22 @@ def filter_short_chunks(
 
 def split_oversized_chunks(
     chunks: list[SectionChunk],
-    max_tokens: int = BGE_M3_MAX_TOKENS,
+    max_tokens: int = TARGET_CHUNK_TOKENS,
     chunk_overlap: int = BGE_M3_CHUNK_OVERLAP,
 ) -> list[SectionChunk]:
     """
-    Any SectionChunk whose full_text exceeds BGE-M3's 8,192-token limit is
-    split into sub-chunks using the real BGE-M3 tokeniser as the length
-    function. Heading and page metadata are propagated to every sub-chunk.
-    Splits are labelled "(part 1)", "(part 2)", etc.
+    Split any SectionChunk whose full_text exceeds `max_tokens` into sub-chunks,
+    using the real BGE-M3 tokeniser as the length function.  Heading and page
+    metadata are propagated to every sub-chunk; splits are labelled
+    "(part 1)", "(part 2)", … and reassembled by gather_full_section for
+    extract mode.
+
+    `max_tokens` defaults to TARGET_CHUNK_TOKENS (a retrieval-quality target),
+    NOT the 8192 embedding ceiling — see TARGET_CHUNK_TOKENS for why smaller
+    chunks retrieve better.  It is clamped to the embedding limit for safety.
     """
+    max_tokens = min(max_tokens, BGE_M3_MAX_TOKENS)
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=max_tokens,
         chunk_overlap=chunk_overlap,
@@ -721,11 +736,18 @@ class DocumentIndex:
         base_url: str = "http://localhost:11434/v1",
         api_key: str = "ollama",
         embedding_model: str = "bge-m3",
+        target_chunk_tokens: int = TARGET_CHUNK_TOKENS,
     ) -> "DocumentIndex":
         """
         Run the five shared preparation phases and return a DocumentIndex.
         This is the only step that reads the PDF — all subsequent operations
         work entirely from the returned index.
+
+        target_chunk_tokens : retrieval-quality target size for splitting large
+                              sections (default TARGET_CHUNK_TOKENS=1000).  Lower
+                              it (e.g. 600) for finer-grained retrieval on dense
+                              US agreements; raise it to keep larger sections
+                              whole.  Never exceeds the 8192 embedding ceiling.
         """
         print(f"[1/5] Extracting blocks from: {pdf_path}")
         blocks = extract_structured_blocks(pdf_path)
@@ -747,8 +769,9 @@ class DocumentIndex:
         print(f"      → {len(chunks)} sections after removing near-empty chunks")
 
         print("[4/5] Splitting oversized chunks...")
-        chunks = split_oversized_chunks(chunks)
-        print(f"      → {len(chunks)} chunks after token-safe split")
+        chunks = split_oversized_chunks(chunks, max_tokens=target_chunk_tokens)
+        print(f"      → {len(chunks)} chunks after token-safe split "
+              f"(target {min(target_chunk_tokens, BGE_M3_MAX_TOKENS)} tokens)")
 
         print("[5/5] Building vector store...")
         vector_store = build_vector_store(
