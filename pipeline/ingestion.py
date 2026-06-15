@@ -355,6 +355,98 @@ _MIN_HEADING_CHARS = 4
 _MIN_HEADING_LETTERS = 2
 
 
+# Structural heading markers (US + UK).  Many US credit agreements do NOT bold
+# their Section headings (so font-based detection misses them) and often run the
+# heading inline with the body ("Section 2.01 Commitment.  Subject to …").
+# Detecting these by pattern — in addition to font/bold — is what lets the
+# document chunk into real per-Section pieces instead of giant ARTICLE blobs.
+_STRUCT_HEADING_RE = re.compile(
+    r'^\s*(?:'
+    r'article\s+[ivxlcdm]+'              # ARTICLE I, ARTICLE IV
+    r'|(?:section|sec\.)\s+\d+(?:\.\d+)+'  # Section 1.01, Sec. 2.03, 1.0.1
+    r'|§\s*\d+(?:\.\d+)*'                  # § 2.3
+    r'|\d+(?:\.\d+)+'                      # 1.01 / 1.0.1 at the line start
+    r')\b',
+    re.IGNORECASE,
+)
+
+# A pattern-detected heading must be at least this short to be treated as a
+# standalone heading line; longer blocks are run-in headings that should have
+# been split by split_structural_headings first.
+_MAX_PATTERN_HEADING_CHARS = 160
+
+# Run-in splitting: a block longer than this that begins with a structural
+# marker is treated as "heading. body" and split at the title's end.
+_RUNIN_MIN_BLOCK_CHARS = 120
+_RUNIN_MAX_HEADING_CHARS = 140
+
+
+def split_structural_headings(blocks: list[TextBlock]) -> list[TextBlock]:
+    """
+    Split run-in section headings into a separate heading block + body block.
+
+    Many US agreements write the section heading inline with its first
+    paragraph, e.g.:
+
+        "Section 2.01  Commitment.  Subject to the terms hereof, each Lender
+         severally agrees to make Loans …"
+
+    PyMuPDF returns that as one long block.  Because it is long, font/pattern
+    heading detection won't (and shouldn't) treat the whole thing as a heading.
+    This step cuts it into:
+
+        heading: "Section 2.01  Commitment."
+        body:    "Subject to the terms hereof, each Lender …"
+
+    so the heading can be detected and the section chunked correctly.  Blocks
+    that don't start with a structural marker, or that are already short, are
+    returned unchanged.
+    """
+    out: list[TextBlock] = []
+    n_split = 0
+
+    for b in blocks:
+        stripped = b.text.strip()
+        m = _STRUCT_HEADING_RE.match(stripped)
+
+        if not m or len(stripped) <= _RUNIN_MIN_BLOCK_CHARS:
+            out.append(b)
+            continue
+
+        # Long block that begins with a marker → run-in heading.  The title runs
+        # from the end of the marker to the first sentence terminator.
+        rest = stripped[m.end():]
+        pm = re.search(r'\.\s', rest)
+        if not pm:
+            out.append(b)
+            continue
+
+        cut = m.end() + pm.end()
+        head = stripped[:cut].strip()
+        body = stripped[cut:].strip()
+        if not body or len(head) > _RUNIN_MAX_HEADING_CHARS:
+            out.append(b)
+            continue
+
+        out.append(pydantic_copy(b, {"text": head}))
+        out.append(pydantic_copy(b, {"text": body}))
+        n_split += 1
+
+    if n_split:
+        print(f"      → Split {n_split} run-in section heading(s)")
+    return out
+
+
+def _is_structural_heading(text: str) -> bool:
+    """True if `text` begins with a recognised section marker and is short
+    enough to be a standalone heading line (not a run-in paragraph)."""
+    stripped = text.strip()
+    return (
+        len(stripped) <= _MAX_PATTERN_HEADING_CHARS
+        and _STRUCT_HEADING_RE.match(stripped) is not None
+    )
+
+
 def _is_valid_heading_text(text: str) -> bool:
     """
     Return True only if `text` looks like a genuine section heading.
@@ -379,10 +471,14 @@ def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
     Mark blocks as headings based on font size and boldness, with a validity
     guard that prevents artefacts from being promoted to headings.
 
-    A block is a heading if ALL of:
-    - It passes _is_valid_heading_text (minimum length and letter count), AND
-    - Its font size exceeds 1.1× the document median,
-      OR it is bold and short (< 120 characters).
+    A block is a heading if it passes _is_valid_heading_text (minimum length
+    and letter count) AND any of:
+    - Its font size exceeds 1.1× the document median, OR
+    - It is bold and short (< 120 characters), OR
+    - It begins with a structural section marker (ARTICLE I, Section 1.01,
+      § 2.3, 1.0.1) and is short enough to be a standalone heading line.
+      This last signal is essential for US agreements that do not bold their
+      Section headings.
     """
     font_sizes = [b.font_size for b in blocks if b.font_size > 0]
     if not font_sizes:
@@ -395,7 +491,11 @@ def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
             block.font_size > median_size * 1.1
             or (block.is_bold and len(block.text) < 120)
         )
-        is_heading = visually_a_heading and _is_valid_heading_text(block.text)
+        structurally_a_heading = _is_structural_heading(block.text)
+        is_heading = (
+            (visually_a_heading or structurally_a_heading)
+            and _is_valid_heading_text(block.text)
+        )
         updated.append(pydantic_copy(block, {"is_heading": is_heading}))
     return updated
 
@@ -492,8 +592,12 @@ def filter_short_chunks(
         if total_chars >= min_body_chars:
             # Enough text anywhere in the chunk (heading or body) to be real.
             kept.append(chunk)
-        elif has_section_number and body_chars > 0:
-            # Keep short-but-not-empty numbered sections (structural markers)
+        elif has_section_number:
+            # Keep numbered/structural headings even when their direct body is
+            # empty — an "ARTICLE I DEFINITIONS" or "Section 1.01" container
+            # whose content lives in child sections is a real navigation anchor,
+            # not junk.  (Pure-number junk like "4" never reaches here: it fails
+            # heading validation upstream and is not chunked.)
             kept.append(chunk)
         else:
             removed_labels.append(repr(chunk.heading[:40]))
@@ -636,6 +740,7 @@ class DocumentIndex:
         print(f"      → {len(blocks)} blocks after filtering")
 
         print("[3/5] Chunking by section...")
+        blocks = split_structural_headings(blocks)
         chunks = chunk_by_section(blocks)
         print(f"      → {len(chunks)} raw sections found")
         chunks = filter_short_chunks(chunks)
