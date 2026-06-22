@@ -347,4 +347,13 @@ def run_extract(
         print("      → All candidates were header-only; returning best-effort fallback")
         result = header_only_fallback
 
+    # [Step 0] Final decisive dump: show exactly what each field of the returned
+    # ExtractionResult holds, so we can tell whether result.content is full (and
+    # the caller is reading the wrong field) or genuinely truncated.
+    print("      → [diag] RETURN heading      :", repr(result.heading))
+    print("      → [diag] RETURN content_len  :", len(result.content))
+    print("      → [diag] RETURN content[:200]:", repr(result.content[:200]))
+    print("      → [diag] RETURN verified      :", result.verified)
+    print("      → [diag] RETURN llm_output    :", repr((result.llm_output or "")[:120]))
+
     return result
