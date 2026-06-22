@@ -211,6 +211,16 @@ def verify_with_llm(
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+# A gathered candidate whose collected body (the chunk *content*, excluding the
+# heading line) has fewer than this many characters is treated as "header-only"
+# — i.e. gather_full_section returned just the section title with no substantive
+# text beneath it. Such a candidate is skipped in favour of the next one.
+# Set conservatively (effectively: body is empty/whitespace) so genuine short
+# clauses like "Not applicable." are never skipped. Tune upward if the Step-0
+# diagnostics show near-empty (a handful of chars) header echoes slipping through.
+_MIN_SECTION_BODY_CHARS = 1
+
+
 def run_extract(
     index: DocumentIndex,
     section_query: str,
@@ -269,11 +279,35 @@ def run_extract(
     # Retry loop
     print("[extract] Gathering & verifying section...")
     result: ExtractionResult | None = None
+    # Fallback so we never return None / raise if EVERY candidate is header-only:
+    # remember the first header-only merge and fall back to it as a last resort.
+    header_only_fallback: ExtractionResult | None = None
 
     for attempt, candidate_doc in enumerate(candidate_docs, start=1):
         heading = candidate_doc.metadata.get("heading", "?")
         section_chunks = gather_full_section(candidate_doc, index.chunks)
         merged = merge_section_chunks(section_chunks)
+
+        # Body length excludes the heading line(s): merge_section_chunks bakes the
+        # heading into merged.content, so measure the raw chunk bodies instead.
+        body_chars = sum(len(c.content.strip()) for c in section_chunks)
+
+        # [Step 0] Diagnostic: surface what each candidate actually gathered so a
+        # header-only failure is visible in the logs and we can confirm which
+        # candidate/branch produced it.
+        print(f"      → [diag] attempt {attempt}: heading={heading!r}, "
+              f"chunks={len(section_chunks)}, body_chars={body_chars}")
+
+        # [Step 1] Guard: a candidate that gathers to just its heading (no real
+        # body) is not a usable section. Skip it and try the next candidate —
+        # even when verify=False, where previously the first candidate was
+        # returned unchecked.
+        if body_chars < _MIN_SECTION_BODY_CHARS:
+            if header_only_fallback is None:
+                header_only_fallback = merged
+            print(f"      → Skipping header-only candidate ({heading}); "
+                  f"no body text gathered")
+            continue
 
         if not verify:
             result = merged
@@ -295,5 +329,11 @@ def run_extract(
             break
 
         print(f"      → Attempt {attempt} failed ({heading}), trying next...")
+
+    if result is None:
+        # Every candidate was header-only. Fall back to the first such merge so
+        # callers still get a (clearly thin) result rather than None.
+        print("      → All candidates were header-only; returning best-effort fallback")
+        result = header_only_fallback
 
     return result

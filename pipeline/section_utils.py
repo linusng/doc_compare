@@ -116,7 +116,7 @@ def _is_child_section(parent_num: str, candidate_heading: str) -> bool:
 # ── Named structural sections (Schedule N, Annex A, Appendix 3, …) ────────────
 
 _NAMED_PREFIX_RE = re.compile(
-    r'^(schedule|annex|appendix|exhibit|attachment|part)\s+(\w+)',
+    r'^(schedule|annex|appendix|exhibit|attachment|part)\s+(\d+(?:\.\d+)*|\w+)',
     re.IGNORECASE,
 )
 
