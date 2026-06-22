@@ -474,19 +474,53 @@ def _is_valid_heading_text(text: str) -> bool:
     return True
 
 
+# Margin bands (as a fraction of page height) in which a block is considered to
+# be in the header/footer area rather than the body. A genuine section heading
+# lives in the body; page numbers, running titles and footer notes like
+# "<page no.> Internal" sit in these margins. Blocks centred inside a margin band
+# are never promoted to headings, which stops a per-page footer such as
+# "2 Internal" from being mis-parsed as section "2" and splitting a section.
+_HEADING_TOP_MARGIN_FRAC = 0.08      # top 8% of the page
+_HEADING_BOTTOM_MARGIN_FRAC = 0.90   # bottom 10% of the page
+
+
+def _in_page_margin(
+    block: TextBlock,
+    top_frac: float = _HEADING_TOP_MARGIN_FRAC,
+    bottom_frac: float = _HEADING_BOTTOM_MARGIN_FRAC,
+) -> bool:
+    """
+    True if the block's vertical centre sits in the top or bottom margin band of
+    its page — i.e. the header/footer zone where headings never appear.
+
+    Returns False when page height is unknown (0), so detection degrades to the
+    prior font/structure behaviour rather than silently dropping headings.
+    """
+    h = block.page_height
+    if h <= 0:
+        return False
+    center_frac = ((block.bbox[1] + block.bbox[3]) / 2.0) / h
+    return center_frac <= top_frac or center_frac >= bottom_frac
+
+
 def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
     """
     Mark blocks as headings based on font size and boldness, with a validity
     guard that prevents artefacts from being promoted to headings.
 
     A block is a heading if it passes _is_valid_heading_text (minimum length
-    and letter count) AND any of:
+    and letter count), is NOT in a page margin band (see _in_page_margin), AND
+    any of:
     - Its font size exceeds 1.1× the document median, OR
     - It is bold and short (< 120 characters), OR
     - It begins with a structural section marker (ARTICLE I, Section 1.01,
       § 2.3, 1.0.1) and is short enough to be a standalone heading line.
       This last signal is essential for US agreements that do not bold their
       Section headings.
+
+    The margin guard is what stops a recurring footer like "<page no.> Internal"
+    — whose per-page text varies, so the text-based filters miss it — from being
+    promoted to a heading and parsed as a spurious section number.
     """
     font_sizes = [b.font_size for b in blocks if b.font_size > 0]
     if not font_sizes:
@@ -494,17 +528,27 @@ def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
 
     median_size = statistics.median(font_sizes)
     updated = []
+    n_margin_suppressed = 0
     for block in blocks:
         visually_a_heading = (
             block.font_size > median_size * 1.1
             or (block.is_bold and len(block.text) < 120)
         )
         structurally_a_heading = _is_structural_heading(block.text)
+        in_margin = _in_page_margin(block)
         is_heading = (
             (visually_a_heading or structurally_a_heading)
             and _is_valid_heading_text(block.text)
+            and not in_margin
         )
+        if in_margin and (visually_a_heading or structurally_a_heading) \
+                and _is_valid_heading_text(block.text):
+            n_margin_suppressed += 1
         updated.append(pydantic_copy(block, {"is_heading": is_heading}))
+
+    if n_margin_suppressed:
+        print(f"      → [diag] Suppressed {n_margin_suppressed} margin block(s) "
+              f"that would otherwise have been promoted to headings")
     return updated
 
 
