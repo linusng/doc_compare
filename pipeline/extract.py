@@ -189,24 +189,35 @@ def verify_with_llm(
     api_key: str = "ollama",
 ) -> tuple[bool, str]:
     """
-    Ask the LLM to confirm the retrieved chunk matches section_query.
-    Returns (is_confirmed, llm_output).
+    Confirm whether the gathered chunk IS the requested section.
+
+    This is a pure yes/no judgement — it must NOT regenerate or "clean" the
+    section text. The authoritative section content is the deterministic
+    merge_section_chunks output (run_extract keeps it in result.content); asking
+    a weak model to reproduce the body is lossy (it tends to collapse a long
+    section down to just its heading), so verification only sets a flag.
+
+    Returns (is_confirmed, raw_llm_answer). The raw answer is kept for audit/
+    debugging only — never use it as the section's content.
     """
     llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", (
-            "You are a legal document parser. "
-            f"Given a candidate text block, confirm whether it is the "
-            f'"{section_query}" section. '
-            "If yes, return only the cleaned section text. "
-            "If no, respond with exactly: NOT_FOUND"
+            "You are a legal document parser. You are given a candidate text "
+            f'block and must decide whether it is the "{section_query}" section '
+            "of the agreement. Judge using the heading and the body content "
+            "together.\n\n"
+            "Respond with EXACTLY one word and nothing else:\n"
+            "- YES if the block is that section.\n"
+            "- NO if it is not."
         )),
         ("human", "{text}"),
     ])
 
     output = (prompt | llm).invoke({"text": doc.page_content[:4000]}).content.strip()
-    return output != "NOT_FOUND", output
+    confirmed = output.strip().upper().startswith("YES")
+    return confirmed, output
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
