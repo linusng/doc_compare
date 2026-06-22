@@ -243,6 +243,15 @@ def gather_full_section(
         if _is_child_section(best_num, chunk.heading):
             collected.append(chunk)
             continue
+        # [Step 0] Report exactly which chunk stopped the walk — this is the
+        # chunk that cuts the section off "halfway". cand_num tells us how it was
+        # parsed (e.g. a defined term '2.5%' mis-read as section '2.5', or a
+        # running title '2 THE FACILITY' promoted to a heading mid-section).
+        print(
+            f"      → [diag] gather stopped at chunk_id={chunk.chunk_id} "
+            f"(parsed section number={cand_num!r}, not a child of {best_num!r}); "
+            f"heading={chunk.heading[:70]!r}"
+        )
         break                                # sibling or unrelated section
 
     # Walk backward for any earlier split parts.
