@@ -52,6 +52,29 @@ class ExtractionResult(BaseModel):
     llm_output: str = None
 
 
+class ContentMatchResult(BaseModel):
+    """
+    Result of find mode (run_find): the passage of content that best matches a
+    free-text query.
+
+    `found` is False — and `content` is None — when no candidate passage is
+    confirmed to match (the "return No" case). Callers can check `result.found`
+    or read `result.answer` ("Yes"/"No").
+    """
+    query: str
+    found: bool = False
+    content: str | None = None
+    heading: str | None = None
+    pages: list = []
+    chunk_id: int | None = None
+    score: float | None = None
+    llm_output: str | None = None
+
+    @property
+    def answer(self) -> str:
+        return "Yes" if self.found else "No"
+
+
 class SectionEvidence(BaseModel):
     """Evidence found in one section relevant to a collation statement."""
     heading: str
