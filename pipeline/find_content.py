@@ -21,6 +21,12 @@ from langchain_openai import ChatOpenAI
 
 from .ingestion import DocumentIndex
 from .models import ContentMatchResult
+from .section_utils import (
+    _extract_named_prefix,
+    _extract_section_number,
+    gather_full_section,
+    merge_section_chunks,
+)
 
 
 # ── Semantic retrieval ────────────────────────────────────────────────────────
@@ -84,6 +90,72 @@ def confirm_content_match(
     ).content.strip()
     confirmed = output.strip().upper().startswith("YES")
     return confirmed, output
+
+
+# ── Candidate materialisation (avoid header-only matches) ─────────────────────
+
+def _body_len(doc: Document) -> int:
+    """Length of the chunk's body (content), excluding the heading line."""
+    n = doc.metadata.get("content_length")
+    if n is not None:
+        return int(n)
+    # Fallback: page_content is "<heading>\n<content>"; subtract the heading.
+    heading = doc.metadata.get("heading", "") or ""
+    return max(0, len(doc.page_content.strip()) - len(heading.strip()))
+
+
+def _is_header_only_container(doc: Document) -> bool:
+    """
+    True if the candidate is a section *title* with no body of its own —
+    e.g. '5. INSURANCE' or 'Schedule 2 …' kept by filter_short_chunks as a
+    navigation anchor. Its page_content is just the heading, so returning it
+    gives no write-up.
+
+    A defined-term chunk whose meaning lives in the heading itself (e.g.
+    '"Margin" means 0.80 per cent.') is NOT flagged: it has no leading section
+    number / named prefix, so the heading IS the content.
+    """
+    if _body_len(doc) > 0:
+        return False
+    heading = doc.metadata.get("heading", "") or ""
+    return (
+        _extract_section_number(heading) is not None
+        or _extract_named_prefix(heading) is not None
+    )
+
+
+def materialize_candidate(
+    doc: Document,
+    index: DocumentIndex,
+) -> Document | None:
+    """
+    Return a Document whose page_content holds a real write-up.
+
+    - Normal body chunk (or content-bearing heading): returned as-is.
+    - Header-only section container: expanded to the full section body via
+      gather_full_section + merge_section_chunks, so the write-up is included.
+    - No write-up anywhere (empty container with no gatherable body): None, so
+      the caller skips it and looks at the next candidate.
+    """
+    if not _is_header_only_container(doc):
+        return doc if doc.page_content.strip() else None
+
+    section_chunks = gather_full_section(doc, index.chunks)
+    body_chars = sum(len(c.content.strip()) for c in section_chunks)
+    if body_chars == 0:
+        return None  # truly nothing beneath this title
+
+    merged = merge_section_chunks(section_chunks)
+    return Document(
+        page_content=merged.content,
+        metadata={
+            **doc.metadata,
+            "heading": merged.heading,
+            "pages": merged.pages,
+            "content_length": len(merged.content),
+            "expanded_from_heading": True,
+        },
+    )
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -150,24 +222,51 @@ def run_find(
         print(f"      → Best score {best_score:.4f} < min_score {min_score} → No")
         return ContentMatchResult(query=query, found=False, score=float(best_score))
 
-    # Without verification, return the single closest passage.
+    # Without verification, return the closest passage that has a real write-up
+    # (expanding a header-only section container into its body, skipping any
+    # candidate with no write-up at all).
     if not verify:
-        print(f"      → Returning closest passage: {best_doc.metadata.get('heading')!r}")
-        return _to_result(query, best_doc, best_score, llm_output=None, found=True)
+        for doc, score in candidates:
+            usable = materialize_candidate(doc, index)
+            if usable is None:
+                print(f"      → Skipping header-only candidate "
+                      f"{doc.metadata.get('heading')!r} (no write-up)")
+                continue
+            tag = " (expanded to section body)" if usable.metadata.get("expanded_from_heading") else ""
+            print(f"      → Returning closest passage{tag}: "
+                  f"{usable.metadata.get('heading')!r}")
+            return _to_result(query, usable, score, llm_output=None, found=True)
+        print("      → No candidate had a write-up → No")
+        return ContentMatchResult(query=query, found=False, score=float(best_score))
 
-    # Verify loop: first confirmed candidate wins.
+    # Verify loop: first confirmed candidate WITH a real write-up wins. Header-
+    # only containers are expanded to their section body before confirmation;
+    # candidates with no write-up are skipped so the loop reaches real content
+    # instead of stopping on a bare heading at attempt 1.
     print("[find] Verifying candidates...")
     for attempt, (doc, score) in enumerate(candidates, start=1):
         heading = doc.metadata.get("heading", "?")
+
+        usable = materialize_candidate(doc, index)
+        if usable is None:
+            print(f"      → [diag] attempt {attempt}: score={score:.4f}, "
+                  f"heading={heading!r} → skipped (header-only, no write-up)")
+            continue
+
+        expanded = bool(usable.metadata.get("expanded_from_heading"))
         confirmed, llm_output = confirm_content_match(
-            doc, query, llm_model=llm_model, base_url=base_url, api_key=api_key,
+            usable, query, llm_model=llm_model, base_url=base_url, api_key=api_key,
         )
         print(f"      → [diag] attempt {attempt}: score={score:.4f}, "
-              f"heading={heading!r}, confirmed={confirmed}")
+              f"heading={usable.metadata.get('heading')!r}, "
+              f"body_chars={len(usable.page_content)}, expanded={expanded}, "
+              f"confirmed={confirmed}")
 
         if confirmed:
-            print(f"      → Matched on attempt {attempt}: {heading!r}")
-            return _to_result(query, doc, score, llm_output=llm_output, found=True)
+            print(f"      → Matched on attempt {attempt}: "
+                  f"{usable.metadata.get('heading')!r}"
+                  f"{' (expanded to section body)' if expanded else ''}")
+            return _to_result(query, usable, score, llm_output=llm_output, found=True)
 
     # Nothing confirmed across all candidates → No.
     print("      → No candidate confirmed → No")
