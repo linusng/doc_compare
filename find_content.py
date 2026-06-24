@@ -71,13 +71,15 @@ def main() -> None:
 
     print("\n── Find Result ────────────────────────────────────────────────")
     print(f"Match    : {result.answer}")
-    if result.found:
-        print(f"Section  : {result.heading}")
-        print(f"Pages    : {result.pages}")
-        print(f"Score    : {result.score:.4f}")
-        print(f"\n{result.content[:1000]}")
-    else:
+    if not result.found:
         print("No")
+        return
+
+    print(f"Confirmed: {len(result.matches)} match(es)")
+    for i, m in enumerate(result.matches, start=1):
+        tag = " (expanded to section body)" if m.expanded else ""
+        print(f"\n[{i}] score={m.score:.4f}  pages={m.pages}  {m.heading!r}{tag}")
+        print(m.content[:1000])
 
 
 if __name__ == "__main__":

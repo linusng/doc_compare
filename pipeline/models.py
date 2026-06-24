@@ -52,23 +52,42 @@ class ExtractionResult(BaseModel):
     llm_output: str = None
 
 
+class ContentMatch(BaseModel):
+    """One confirmed passage matched by run_find."""
+    content: str
+    heading: str | None = None
+    pages: list = []
+    chunk_id: int | None = None
+    score: float | None = None
+    llm_output: str | None = None
+    expanded: bool = False   # True if expanded from a header-only section container
+
+
 class ContentMatchResult(BaseModel):
     """
-    Result of find mode (run_find): the passage of content that best matches a
+    Result of find mode (run_find): the passage(s) of content that match a
     free-text query.
 
-    `found` is False — and `content` is None — when no candidate passage is
-    confirmed to match (the "return No" case). Callers can check `result.found`
-    or read `result.answer` ("Yes"/"No").
+    run_find evaluates every candidate and keeps all that the LLM confirms.
+    `matches` holds every confirmed passage, ranked best (highest score) first.
+    The top-level convenience fields (content, heading, pages, …) mirror the
+    single best match, so `result.content` still works.
+
+    `found` is False — `matches` is empty and `content` is None — when no
+    candidate is confirmed (the "return No" case). Check `result.found` or read
+    `result.answer` ("Yes"/"No").
     """
     query: str
     found: bool = False
+    # Best confirmed match (mirrors matches[0]) — convenience for single-result use.
     content: str | None = None
     heading: str | None = None
     pages: list = []
     chunk_id: int | None = None
     score: float | None = None
     llm_output: str | None = None
+    # Every confirmed match, ranked best-first.
+    matches: list[ContentMatch] = []
 
     @property
     def answer(self) -> str:

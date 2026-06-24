@@ -20,7 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
 from .ingestion import DocumentIndex
-from .models import ContentMatchResult
+from .models import ContentMatch, ContentMatchResult
 from .section_utils import (
     _extract_named_prefix,
     _extract_section_number,
@@ -160,17 +160,34 @@ def materialize_candidate(
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-def _to_result(query: str, doc: Document, score: float, llm_output: str | None,
-               found: bool) -> ContentMatchResult:
-    return ContentMatchResult(
-        query=query,
-        found=found,
-        content=doc.page_content if found else None,
+def _to_match(doc: Document, score: float, llm_output: str | None) -> ContentMatch:
+    return ContentMatch(
+        content=doc.page_content,
         heading=doc.metadata.get("heading"),
         pages=doc.metadata.get("pages", []),
         chunk_id=doc.metadata.get("chunk_id"),
         score=float(score),
         llm_output=llm_output,
+        expanded=bool(doc.metadata.get("expanded_from_heading")),
+    )
+
+
+def _build_result(query: str, matches: list[ContentMatch],
+                  best_score: float | None) -> ContentMatchResult:
+    """Wrap the confirmed matches, mirroring the best one in the top-level fields."""
+    if not matches:
+        return ContentMatchResult(query=query, found=False, score=best_score)
+    best = matches[0]
+    return ContentMatchResult(
+        query=query,
+        found=True,
+        content=best.content,
+        heading=best.heading,
+        pages=best.pages,
+        chunk_id=best.chunk_id,
+        score=best.score,
+        llm_output=best.llm_output,
+        matches=matches,
     )
 
 
@@ -185,26 +202,29 @@ def run_find(
     api_key: str = "ollama",
 ) -> ContentMatchResult:
     """
-    Find the passage of content that best matches a free-text query.
+    Find the passage(s) of content that match a free-text query.
 
-    Strategy (mirrors run_extract):
+    Strategy:
     1. Rank chunks by semantic similarity to the query.
-    2. If verify=True, walk the ranked list asking the LLM to confirm each
-       candidate; return the first confirmed passage.
+    2. If verify=True, evaluate EVERY candidate (expanding header-only section
+       containers to their body, skipping candidates with no write-up) and keep
+       all that the LLM confirms — not just the first. Confirmed matches are
+       ranked best (highest similarity) first.
     3. If nothing is retrieved/confirmed, return found=False (the "No" case).
 
     Args:
         index:     Pre-built DocumentIndex (DocumentIndex.from_pdf(...)).
         query:     Arbitrary free-text to match against the document content.
-        verify:    If True, LLM-confirm candidates in ranked order (recommended).
+        verify:    If True, LLM-confirm every candidate and return all matches.
                    If False, return the single highest-similarity passage.
         top_k:     How many candidate chunks to retrieve/consider.
-        min_score: Optional similarity floor. If the best candidate scores below
-                   this, return found=False without calling the LLM.
+        min_score: Optional similarity floor. Candidates scoring below it are not
+                   considered; if none clear it, the result is No.
 
     Returns:
-        ContentMatchResult. result.found / result.answer indicate Yes/No;
-        result.content holds the matched passage when found.
+        ContentMatchResult. `result.matches` lists every confirmed passage,
+        best-first; the top-level fields (content/heading/…) mirror matches[0].
+        result.found / result.answer indicate Yes/No.
     """
     print(f"\n[find] Searching content for: '{query}'")
 
@@ -217,10 +237,12 @@ def run_find(
     print(f"      → {len(candidates)} candidates (best score {best_score:.4f}: "
           f"{best_doc.metadata.get('heading')!r})")
 
-    # Optional hard similarity floor — nothing close enough to bother verifying.
-    if min_score is not None and best_score < min_score:
-        print(f"      → Best score {best_score:.4f} < min_score {min_score} → No")
-        return ContentMatchResult(query=query, found=False, score=float(best_score))
+    # Optional hard similarity floor — drop candidates not close enough to bother.
+    if min_score is not None:
+        candidates = [(d, s) for d, s in candidates if s >= min_score]
+        if not candidates:
+            print(f"      → No candidate ≥ min_score {min_score} → No")
+            return ContentMatchResult(query=query, found=False, score=float(best_score))
 
     # Without verification, return the closest passage that has a real write-up
     # (expanding a header-only section container into its body, skipping any
@@ -235,15 +257,17 @@ def run_find(
             tag = " (expanded to section body)" if usable.metadata.get("expanded_from_heading") else ""
             print(f"      → Returning closest passage{tag}: "
                   f"{usable.metadata.get('heading')!r}")
-            return _to_result(query, usable, score, llm_output=None, found=True)
+            return _build_result(query, [_to_match(usable, score, None)], float(best_score))
         print("      → No candidate had a write-up → No")
         return ContentMatchResult(query=query, found=False, score=float(best_score))
 
-    # Verify loop: first confirmed candidate WITH a real write-up wins. Header-
-    # only containers are expanded to their section body before confirmation;
-    # candidates with no write-up are skipped so the loop reaches real content
-    # instead of stopping on a bare heading at attempt 1.
-    print("[find] Verifying candidates...")
+    # Evaluate EVERY candidate and collect all confirmed matches. Header-only
+    # containers are expanded to their section body before confirmation;
+    # candidates with no write-up are skipped.
+    print("[find] Verifying all candidates...")
+    confirmed_matches: list[ContentMatch] = []
+    seen_content: set[str] = set()
+
     for attempt, (doc, score) in enumerate(candidates, start=1):
         heading = doc.metadata.get("heading", "?")
 
@@ -263,11 +287,18 @@ def run_find(
               f"confirmed={confirmed}")
 
         if confirmed:
-            print(f"      → Matched on attempt {attempt}: "
-                  f"{usable.metadata.get('heading')!r}"
-                  f"{' (expanded to section body)' if expanded else ''}")
-            return _to_result(query, usable, score, llm_output=llm_output, found=True)
+            key = usable.page_content.strip()
+            if key in seen_content:        # skip exact-duplicate passages
+                continue
+            seen_content.add(key)
+            confirmed_matches.append(_to_match(usable, score, llm_output))
 
-    # Nothing confirmed across all candidates → No.
-    print("      → No candidate confirmed → No")
-    return ContentMatchResult(query=query, found=False, score=float(best_score))
+    if not confirmed_matches:
+        print("      → No candidate confirmed → No")
+        return ContentMatchResult(query=query, found=False, score=float(best_score))
+
+    # Rank confirmed matches best (highest similarity) first.
+    confirmed_matches.sort(key=lambda m: -(m.score or 0.0))
+    print(f"      → {len(confirmed_matches)} confirmed match(es); "
+          f"best: {confirmed_matches[0].heading!r}")
+    return _build_result(query, confirmed_matches, float(best_score))
