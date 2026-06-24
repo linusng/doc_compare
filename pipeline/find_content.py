@@ -158,6 +158,37 @@ def materialize_candidate(
     )
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def list_matches(
+    result: ContentMatchResult,
+    content_only: bool = True,
+) -> list:
+    """
+    Flatten a ContentMatchResult's confirmed matches into a plain list,
+    ranked best (highest score) first.
+
+    content_only=True  → list[str]  of the matched passages (result.contents).
+    content_only=False → list[dict] with heading, pages, chunk_id, score,
+                         expanded and content for each match.
+
+    Returns an empty list when nothing was confirmed (the "No" case).
+    """
+    if content_only:
+        return [m.content for m in result.matches]
+    return [
+        {
+            "heading": m.heading,
+            "pages": m.pages,
+            "chunk_id": m.chunk_id,
+            "score": m.score,
+            "expanded": m.expanded,
+            "content": m.content,
+        }
+        for m in result.matches
+    ]
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def _to_match(doc: Document, score: float, llm_output: str | None) -> ContentMatch:

@@ -93,6 +93,11 @@ class ContentMatchResult(BaseModel):
     def answer(self) -> str:
         return "Yes" if self.found else "No"
 
+    @property
+    def contents(self) -> list[str]:
+        """All confirmed match passages as a plain list of strings, best-first."""
+        return [m.content for m in self.matches]
+
 
 class SectionEvidence(BaseModel):
     """Evidence found in one section relevant to a collation statement."""
