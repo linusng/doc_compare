@@ -581,6 +581,20 @@ def _is_structural_section_heading(text: str) -> bool:
     )
 
 
+# The operative opener of an agreement — "THIS AGREEMENT is dated …",
+# "THIS DEED OF GUARANTEE …", "THIS FACILITY AGREEMENT is made …". Within the
+# preamble region this line, not the cover title, should anchor the preamble
+# chunk's heading so the chunk leads with (and is retrievable by) the opener.
+_PREAMBLE_OPENER_RE = re.compile(
+    r"^\s*THIS\s+[\w\s\-,']*\b(?:AGREEMENT|DEED)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_preamble_opener(text: str) -> bool:
+    return _PREAMBLE_OPENER_RE.match(text) is not None
+
+
 def chunk_by_section(blocks: list[TextBlock]) -> list[SectionChunk]:
     """
     Produce one SectionChunk per section: heading + all body text beneath it.
@@ -627,7 +641,17 @@ def chunk_by_section(blocks: list[TextBlock]) -> list[SectionChunk]:
             # structural heading is folded into the running preamble chunk
             # rather than starting a new section.
             if has_structural and not seen_structural and not is_structural:
-                if not current_heading and not current_body:
+                if _is_preamble_opener(block.text):
+                    # Operative opener ("THIS AGREEMENT is dated …") → start the
+                    # preamble proper here so it anchors the chunk heading.
+                    # Flush any preceding cover/title into its own chunk.
+                    saved = flush(len(chunks))
+                    if saved:
+                        chunks.append(saved)
+                    current_heading = block.text
+                    current_body = []
+                    current_pages = {block.page}
+                elif not current_heading and not current_body:
                     # First block in the document → seed the preamble heading.
                     current_heading = block.text
                     current_pages = {block.page}
