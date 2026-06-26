@@ -28,7 +28,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer
 
 from .models import SectionChunk, TextBlock, pydantic_copy
-from .section_utils import _extract_section_number
+from .section_utils import _extract_named_prefix, _extract_section_number
 
 
 # ── Tokeniser (BGE-M3) ────────────────────────────────────────────────────────
@@ -455,6 +455,19 @@ def _is_structural_heading(text: str) -> bool:
     )
 
 
+# Enumerated list markers — '(1)', '(2)', '(a)', '(i)', etc. — that open a
+# parenthesis. In legal documents these introduce list ITEMS (notably the
+# numbered parties in a preamble: "(1) <corporate name>  (2) <bank name>"),
+# not section headings. Promoting them to headings splits the preamble/parties
+# block into fragments, so they are explicitly excluded from heading detection.
+_LIST_ITEM_RE = re.compile(r'^\s*\(\s*(?:\d+|[a-z]|[ivxlcdm]+)\s*\)', re.IGNORECASE)
+
+
+def _is_list_item(text: str) -> bool:
+    """True if the block opens with a parenthesised enumerator like '(1)' / '(a)'."""
+    return _LIST_ITEM_RE.match(text) is not None
+
+
 def _is_valid_heading_text(text: str) -> bool:
     """
     Return True only if `text` looks like a genuine section heading.
@@ -464,12 +477,15 @@ def _is_valid_heading_text(text: str) -> bool:
     - Strings with fewer than _MIN_HEADING_LETTERS alphabetic characters
       (pure numbers, page numbers, symbols)
     - Strings that are purely numeric after stripping whitespace/punctuation
+    - Parenthesised list items ('(1) …', '(a) …') — list entries, not headings
     """
     stripped = text.strip()
     if len(stripped) < _MIN_HEADING_CHARS:
         return False
     letter_count = sum(1 for c in stripped if c.isalpha())
     if letter_count < _MIN_HEADING_LETTERS:
+        return False
+    if _is_list_item(stripped):
         return False
     return True
 
@@ -612,50 +628,75 @@ def filter_short_chunks(
     min_body_chars: int = _MIN_BODY_CHARS,
 ) -> list[SectionChunk]:
     """
-    Remove chunks whose body content is below min_body_chars characters.
+    Fold short, non-structural fragments back into their relevant section
+    instead of discarding them, so NO document text is lost.
 
-    These are almost always indexing artefacts:
-    - A bold page number was misdetected as a heading → chunk body is empty.
-    - A navigation label ("Move To") was misdetected as a heading → body is
-      whatever text followed before the next real heading (often nothing).
+    By the time chunking runs, the only legitimate removals (TOC pages, running
+    headers/footers, page numbers) have already happened upstream — so a short
+    chunk left here is real prose that simply got over-split, most often the
+    preamble/parties block:
 
-    Chunks that pass the heading validity test but genuinely have no body
-    content — e.g. a section heading immediately followed by a sub-section —
-    are intentionally kept only if they have a proper section number prefix,
-    since those carry structural meaning even when empty.
+        "THIS AGREEMENT is dated … and made BETWEEN:-"
+        "(1) <corporate name>"          ← short fragment
+        "(2) <bank name>"               ← short fragment
 
-    Note: the size test is applied to the chunk's FULL text (heading + body),
-    not the body alone.  In legal documents a defined term is often bold, which
-    causes the entire definition line (e.g. '"Margin" means 0.80 per cent. per
-    annum.') to be promoted to a heading with an empty body.  Measuring the
-    body alone would wrongly drop these — the content lives in the heading.
+    Previously these short fragments were deleted, which is why such a section
+    could not be retrieved. Now each short fragment's full text (heading + body)
+    is appended to the PRECEDING kept chunk — its relevant section — preserving
+    every word and keeping the section whole.
+
+    A chunk is kept as its own section (not merged) when EITHER:
+    - its full text (heading + body) is at least min_body_chars long, OR
+    - it is a structural anchor — a numbered heading ('ARTICLE I', 'Section
+      1.01', '§ 2.3') or a named section ('Schedule 2', 'Annex A') — even when
+      its direct body is empty, since its content lives in child sections.
+
+    The size test is on FULL text (heading + body): a bold defined term such as
+    '"Margin" means 0.80 per cent.' lives in the heading with an empty body and
+    must be kept on the strength of the heading alone.
     """
-    kept = []
-    removed_labels = []
+    kept: list[SectionChunk] = []
+    merged_count = 0
+    merged_samples: list[str] = []
 
     for chunk in chunks:
-        body_chars = len(chunk.content.strip())
         total_chars = len(chunk.full_text.strip())   # heading + body
-        # Recognise structural markers across US/UK conventions — bare numbers
-        # ('1.0.1'), label-prefixed ('Section 1.0.1'), roman ('ARTICLE I'),
-        # and the section symbol ('§ 2.3') — via the shared parser.
-        has_section_number = _extract_section_number(chunk.heading) is not None
+        # Structural anchors (US/UK): bare numbers ('1.0.1'), label-prefixed
+        # ('Section 1.0.1'), roman ('ARTICLE I'), section symbol ('§ 2.3'),
+        # and named sections ('Schedule 2', 'Annex A').
+        is_structural = (
+            _extract_section_number(chunk.heading) is not None
+            or _extract_named_prefix(chunk.heading) is not None
+        )
 
-        if total_chars >= min_body_chars:
-            # Enough text anywhere in the chunk (heading or body) to be real.
+        if total_chars >= min_body_chars or is_structural:
             kept.append(chunk)
-        elif has_section_number:
-            # Keep numbered/structural headings even when their direct body is
-            # empty — an "ARTICLE I DEFINITIONS" or "Section 1.01" container
-            # whose content lives in child sections is a real navigation anchor,
-            # not junk.  (Pure-number junk like "4" never reaches here: it fails
-            # heading validation upstream and is not chunked.)
-            kept.append(chunk)
+            continue
+
+        # Short, non-structural fragment → merge its text into the relevant
+        # (preceding) section rather than dropping it.
+        fragment = chunk.full_text.strip()
+        if not fragment:
+            continue  # genuinely empty after stripping — nothing to preserve
+
+        if kept:
+            prev = kept[-1]
+            new_content = f"{prev.content}\n{fragment}".strip() if prev.content else fragment
+            new_pages = sorted(set(prev.pages) | set(chunk.pages))
+            kept[-1] = pydantic_copy(prev, {"content": new_content, "pages": new_pages})
         else:
-            removed_labels.append(repr(chunk.heading[:40]))
+            # No preceding section yet (document opens with a short fragment):
+            # keep it so following fragments can merge into it.
+            kept.append(chunk)
+            continue
 
-    if removed_labels:
-        print(f"      → Removed {len(removed_labels)} near-empty chunk(s): {removed_labels[:5]}")
+        merged_count += 1
+        if len(merged_samples) < 5:
+            merged_samples.append(repr(chunk.heading[:40]))
+
+    if merged_count:
+        print(f"      → Merged {merged_count} short fragment(s) into their "
+              f"section instead of dropping: {merged_samples}")
 
     return kept
 
@@ -810,7 +851,8 @@ class DocumentIndex:
         chunks = chunk_by_section(blocks)
         print(f"      → {len(chunks)} raw sections found")
         chunks = filter_short_chunks(chunks)
-        print(f"      → {len(chunks)} sections after removing near-empty chunks")
+        print(f"      → {len(chunks)} sections after folding short fragments "
+              f"into their relevant section")
 
         print("[4/5] Splitting oversized chunks...")
         chunks = split_oversized_chunks(chunks, max_tokens=target_chunk_tokens)
