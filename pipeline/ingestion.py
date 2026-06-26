@@ -568,16 +568,44 @@ def detect_headings(blocks: list[TextBlock]) -> list[TextBlock]:
     return updated
 
 
+def _is_structural_section_heading(text: str) -> bool:
+    """
+    True if the heading is a real structural section anchor — a numbered heading
+    ('1.', 'ARTICLE I', 'Section 1.01', '§ 2.3') or a named section ('Schedule
+    2', 'Annex A'). These are the headings allowed to open a new section while
+    still in the preamble; visual-only (bold/large) headings are not.
+    """
+    return (
+        _extract_section_number(text) is not None
+        or _extract_named_prefix(text) is not None
+    )
+
+
 def chunk_by_section(blocks: list[TextBlock]) -> list[SectionChunk]:
     """
     Produce one SectionChunk per section: heading + all body text beneath it.
     Page metadata is accumulated across all blocks in the section.
+
+    Preamble handling: everything before the FIRST structural heading (the
+    recitals and numbered parties — "THIS AGREEMENT … BETWEEN:- (1) … (2) …")
+    is kept as a SINGLE preamble chunk. While still in this region, a
+    visual-only heading (bold/large text such as "BETWEEN:-" or a bold party
+    name) does NOT open a new section — only a structural heading does. This
+    stops the preamble from being fragmented across chunks, which made it
+    impossible to retrieve as one block. The behaviour is disabled when the
+    document has no structural headings at all, so structure-less documents are
+    not collapsed into one giant chunk.
     """
     blocks = detect_headings(blocks)
+    has_structural = any(
+        b.is_heading and _is_structural_section_heading(b.text) for b in blocks
+    )
+
     chunks: list[SectionChunk] = []
     current_heading = ""
     current_body: list[str] = []
     current_pages: set[int] = set()
+    seen_structural = False
 
     def flush(chunk_id: int) -> SectionChunk | None:
         if not current_heading and not current_body:
@@ -593,6 +621,24 @@ def chunk_by_section(blocks: list[TextBlock]) -> list[SectionChunk]:
 
     for block in blocks:
         if block.is_heading:
+            is_structural = _is_structural_section_heading(block.text)
+
+            # Preamble region: before the first structural heading, a non-
+            # structural heading is folded into the running preamble chunk
+            # rather than starting a new section.
+            if has_structural and not seen_structural and not is_structural:
+                if not current_heading and not current_body:
+                    # First block in the document → seed the preamble heading.
+                    current_heading = block.text
+                    current_pages = {block.page}
+                else:
+                    current_body.append(block.text)
+                    current_pages.add(block.page)
+                continue
+
+            if is_structural:
+                seen_structural = True
+
             saved = flush(len(chunks))
             if saved:
                 chunks.append(saved)
