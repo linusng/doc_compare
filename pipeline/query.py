@@ -33,6 +33,7 @@ import json
 import re
 
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
@@ -159,6 +160,55 @@ def _parse_final(text: str) -> dict:
     return {}
 
 
+# ── Tool-calling loop (version-stable: langchain_core + langchain_openai only) ─
+#
+# langchain 1.x removed AgentExecutor / create_tool_calling_agent from
+# langchain.agents. Rather than depend on that churning API, we drive tool calls
+# manually with ChatOpenAI.bind_tools — supported across langchain_core versions.
+
+def _run_agent_loop(
+    question: str,
+    search_tool: StructuredTool,
+    max_iterations: int,
+    llm_model: str,
+    base_url: str,
+    api_key: str,
+) -> str:
+    """
+    Manual tool-calling loop: the model may call `search_document` repeatedly
+    (refining its queries) up to max_iterations, then returns a final message.
+    Returns the final assistant text (expected to contain the JSON answer).
+    """
+    llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
+    llm_with_tools = llm.bind_tools([search_tool])
+
+    messages: list = [
+        SystemMessage(content=_SYSTEM),
+        HumanMessage(content=f"Question: {question}"),
+    ]
+
+    last_text = ""
+    for _ in range(max_iterations):
+        ai: AIMessage = llm_with_tools.invoke(messages)
+        messages.append(ai)
+        if ai.content:
+            last_text = ai.content if isinstance(ai.content, str) else str(ai.content)
+
+        tool_calls = getattr(ai, "tool_calls", None)
+        if not tool_calls:
+            break  # the model produced its final answer
+
+        for call in tool_calls:
+            try:
+                observation = search_tool.invoke(call["args"])
+            except Exception as exc:   # noqa: BLE001 — bad args, etc.
+                observation = f"Tool error: {exc}"
+            messages.append(ToolMessage(content=str(observation),
+                                        tool_call_id=call["id"]))
+
+    return last_text
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_query(
@@ -209,27 +259,20 @@ def run_query(
 
     data: dict = {}
     try:
-        from langchain.agents import AgentExecutor, create_tool_calling_agent
-
-        llm = ChatOpenAI(
-            model=llm_model, base_url=base_url, api_key=api_key, temperature=0,
+        final_text = _run_agent_loop(
+            question, search_tool, max_iterations=max_iterations,
+            llm_model=llm_model, base_url=base_url, api_key=api_key,
         )
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", _SYSTEM),
-            ("human", "Question: {question}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
-        agent = create_tool_calling_agent(llm, [search_tool], prompt)
-        executor = AgentExecutor(
-            agent=agent, tools=[search_tool], verbose=False,
-            max_iterations=max_iterations, handle_parsing_errors=True,
-        )
-        result = executor.invoke({"question": question})
-        data = _parse_final(str(result.get("output", "")))
+        data = _parse_final(final_text)
         print(f"      → Agent searched {len(search_terms)} time(s): {search_terms}")
+        if not data:   # backend ignored tools / produced no JSON → single-shot
+            print("      → No structured answer from loop; trying single-shot")
+            data = _single_shot_fallback(
+                question, pool, llm_model=llm_model, base_url=base_url, api_key=api_key,
+            )
 
     except Exception as exc:   # noqa: BLE001 — tool-calling unsupported, etc.
-        print(f"      → Agent unavailable ({type(exc).__name__}: {exc}); "
+        print(f"      → Agent loop failed ({type(exc).__name__}: {exc}); "
               f"answering from seed retrieval only")
         data = _single_shot_fallback(
             question, pool, llm_model=llm_model, base_url=base_url, api_key=api_key,
