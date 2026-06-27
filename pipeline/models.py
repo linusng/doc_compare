@@ -99,6 +99,43 @@ class ContentMatchResult(BaseModel):
         return [m.content for m in self.matches]
 
 
+class QueryResult(BaseModel):
+    """
+    Result of query mode (run_query): the answer to an open natural-language
+    question, grounded in the document.
+
+    Unlike ContentMatchResult (which returns the passage matching a *description*),
+    run_query answers a *question* ("What is the base currency?") and returns the
+    extracted VALUE ("USD") together with the verbatim REFERENCE phrase that proves
+    it ('"Base Currency" means Dollars ($)').
+
+    Grounding guarantee: `reference` is always a verbatim substring of a retrieved
+    passage — the LLM may decide the answer, but the proof phrase is checked against
+    the source text. If the answer cannot be grounded, `found` is False, `answer`
+    and `reference` are None (the "return No" case). Check `result.found`.
+
+    Fields:
+        answer       : the extracted value, e.g. "USD" / "English law". None if not found.
+        reference    : verbatim phrase from the document that supports the answer.
+        confidence   : "high" | "medium" | "low" — the LLM's self-rated certainty.
+        reasoning    : short LLM rationale, kept for audit only.
+        search_terms : the query strings the agent actually tried (refinement trail).
+        supports     : every retrieved passage the answer draws on (list[ContentMatch]).
+    """
+    question: str
+    found: bool = False
+    answer: str | None = None
+    reference: str | None = None
+    heading: str | None = None
+    pages: list = []
+    chunk_id: int | None = None
+    score: float | None = None
+    confidence: str | None = None
+    reasoning: str | None = None
+    search_terms: list[str] = []
+    supports: list[ContentMatch] = []
+
+
 class SectionEvidence(BaseModel):
     """Evidence found in one section relevant to a collation statement."""
     heading: str
