@@ -91,6 +91,9 @@ def _make_search_tool(index: DocumentIndex, pool: dict[int, tuple[Document, floa
         """Search the document for passages relevant to `query` and return the
         top matches (heading + text). Call this repeatedly with REFINED queries
         — synonyms, defined terms, or rephrasings — until you find the answer."""
+        if any(_normalize(query) == _normalize(t) for t in search_terms):
+            return ("You already searched for that exact wording. Try a DIFFERENT "
+                    "angle: a synonym, the likely defined term, or a rephrasing.")
         search_terms.append(query)
         hits = []
         for doc, score in retrieve_content_candidates(index, query, top_k=top_k):
@@ -190,24 +193,130 @@ def _extract_quotes(data: dict) -> list[tuple[str, str | None]]:
     return pairs
 
 
+_CONF_RANK = {"high": 0, "medium": 1, "low": 2}
+
+
+def _ground_quotes(
+    quote_pairs: list[tuple[str, str | None]],
+    pool: dict[int, tuple[Document, float]],
+) -> tuple[list[QueryReference], int]:
+    """
+    Ground every quote against the retrieved pool, deduping and ranking the
+    survivors (high confidence first, then similarity score).
+
+    Returns (references, dropped) where `dropped` counts quotes that did NOT
+    ground verbatim — the loop uses that signal to ask the agent to re-quote.
+    """
+    references: list[QueryReference] = []
+    seen: set[str] = set()
+    dropped = 0
+    for quote, conf in quote_pairs:
+        grounded = _ground_reference(quote, pool)
+        if grounded is None:
+            dropped += 1
+            continue
+        key = _normalize(quote)
+        if key in seen:                      # same proof quoted twice
+            continue
+        seen.add(key)
+        src_doc, src_score = grounded
+        references.append(QueryReference(
+            reference=str(quote),
+            confidence=conf,
+            heading=src_doc.metadata.get("heading"),
+            pages=src_doc.metadata.get("pages", []),
+            chunk_id=src_doc.metadata.get("chunk_id"),
+            score=float(src_score),
+        ))
+    references.sort(key=lambda r: (_CONF_RANK.get((r.confidence or "").lower(), 3),
+                                   -(r.score or 0.0)))
+    return references, dropped
+
+
 # ── Tool-calling loop (version-stable: langchain_core + langchain_openai only) ─
 #
 # langchain 1.x removed AgentExecutor / create_tool_calling_agent from
 # langchain.agents. Rather than depend on that churning API, we drive tool calls
 # manually with ChatOpenAI.bind_tools — supported across langchain_core versions.
 
+def _coverage_feedback(
+    data: dict,
+    pool: dict[int, tuple[Document, float]],
+    n_distinct_searches: int,
+    min_searches: int,
+    min_references: int,
+) -> str | None:
+    """
+    Decide whether the agent's proposed final answer is good enough to accept.
+
+    Returns None to ACCEPT, or a feedback string telling the agent what to fix:
+      • too few distinct search angles tried,
+      • quotes that did not ground verbatim (re-quote / search again),
+      • fewer grounded references than required (look for more — definition AND
+        operative clause).
+    This is what turns a one-shot loop into a self-correcting one.
+    """
+    answer = data.get("answer") or None
+    quote_pairs = _extract_quotes(data)
+    references, dropped = _ground_quotes(quote_pairs, pool)
+
+    problems: list[str] = []
+
+    # Always make the agent try a few genuinely different angles before it is
+    # allowed to conclude — including when it wants to say "not found".
+    if n_distinct_searches < min_searches:
+        problems.append(
+            f"You have only run {n_distinct_searches} distinct search(es). Search "
+            f"at least {min_searches} DIFFERENT angles (synonyms, the likely "
+            f"defined term, related operative clauses) before concluding."
+        )
+
+    if answer:
+        if dropped:
+            problems.append(
+                f"{dropped} of your quotes were NOT found verbatim in the "
+                f"retrieved passages. Copy each quote character-for-character from "
+                f"a passage the tool returned, or search again to locate the exact "
+                f"wording."
+            )
+        if len(references) < min_references:
+            problems.append(
+                f"You have {len(references)} grounded reference(s) but need at "
+                f"least {min_references}. The answer is often stated in BOTH a "
+                f"definition and an operative clause — search for the other "
+                f"occurrence(s)."
+            )
+
+    if not problems:
+        return None
+    return ("Not finished yet. " + " ".join(problems)
+            + " Use search_document again, then give your final JSON.")
+
+
 def _run_agent_loop(
     question: str,
     search_tool: StructuredTool,
+    pool: dict[int, tuple[Document, float]],
+    search_terms: list[str],
     max_iterations: int,
+    min_searches: int,
+    min_references: int,
+    max_nudges: int,
     llm_model: str,
     base_url: str,
     api_key: str,
-) -> str:
+) -> dict:
     """
-    Manual tool-calling loop: the model may call `search_document` repeatedly
-    (refining its queries) up to max_iterations, then returns a final message.
-    Returns the final assistant text (expected to contain the JSON answer).
+    Self-correcting tool-calling loop.
+
+    The model may call `search_document` repeatedly (refining its queries). When
+    it stops and proposes a final answer, the answer is validated IN-LOOP against
+    the grounding guard and coverage thresholds (min distinct searches, min
+    grounded references). If it falls short, the agent is nudged with specific
+    feedback and the loop continues — up to `max_nudges` corrective rounds —
+    instead of accepting a thin first answer.
+
+    Returns the parsed final JSON dict (may be {} if the model never produced one).
     """
     llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
     llm_with_tools = llm.bind_tools([search_tool])
@@ -217,26 +326,40 @@ def _run_agent_loop(
         HumanMessage(content=f"Question: {question}"),
     ]
 
-    last_text = ""
+    last_data: dict = {}
+    nudges_used = 0
     for _ in range(max_iterations):
         ai: AIMessage = llm_with_tools.invoke(messages)
         messages.append(ai)
-        if ai.content:
-            last_text = ai.content if isinstance(ai.content, str) else str(ai.content)
 
         tool_calls = getattr(ai, "tool_calls", None)
-        if not tool_calls:
-            break  # the model produced its final answer
+        if tool_calls:
+            for call in tool_calls:
+                try:
+                    observation = search_tool.invoke(call["args"])
+                except Exception as exc:   # noqa: BLE001 — bad args, etc.
+                    observation = f"Tool error: {exc}"
+                messages.append(ToolMessage(content=str(observation),
+                                            tool_call_id=call["id"]))
+            continue
 
-        for call in tool_calls:
-            try:
-                observation = search_tool.invoke(call["args"])
-            except Exception as exc:   # noqa: BLE001 — bad args, etc.
-                observation = f"Tool error: {exc}"
-            messages.append(ToolMessage(content=str(observation),
-                                        tool_call_id=call["id"]))
+        # No tool call → the model thinks it is done. Validate before accepting.
+        text = ai.content if isinstance(ai.content, str) else str(ai.content or "")
+        data = _parse_final(text)
+        last_data = data or last_data
 
-    return last_text
+        n_distinct = len({_normalize(t) for t in search_terms})
+        feedback = _coverage_feedback(
+            data, pool, n_distinct, min_searches, min_references,
+        )
+        if feedback is None or nudges_used >= max_nudges:
+            break  # accept the answer
+
+        nudges_used += 1
+        print(f"      → [loop] nudge {nudges_used}/{max_nudges}: {feedback[:110]}…")
+        messages.append(HumanMessage(content=feedback))
+
+    return last_data
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -245,7 +368,10 @@ def run_query(
     index: DocumentIndex,
     question: str,
     top_k: int = 6,
-    max_iterations: int = 5,
+    max_iterations: int = 8,
+    min_searches: int = 2,
+    min_references: int = 1,
+    max_nudges: int = 3,
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
@@ -253,18 +379,24 @@ def run_query(
     """
     Answer an open natural-language question about the document.
 
-    Strategy (agentic retrieve-refine + grounding guard):
+    Strategy (self-correcting agentic retrieve-refine + grounding guard):
     1. A tool-calling agent drives `search_document`, issuing and REFINING its own
-       queries until it can answer or gives up (capped at max_iterations).
-    2. The agent returns answer + a verbatim reference quote + confidence.
-    3. The reference is verified deterministically against the passages actually
-       retrieved; an ungrounded (hallucinated/paraphrased) quote → found=False.
+       queries (repeated wording is rejected to force genuine variation).
+    2. When it proposes a final answer it is validated IN-LOOP: if it tried too
+       few distinct searches, quoted text that does not ground verbatim, or found
+       fewer references than required, it is nudged with specific feedback and
+       keeps going (up to max_nudges corrective rounds).
+    3. Every surviving quote is verified deterministically against the retrieved
+       passages; ungrounded (hallucinated/paraphrased) quotes are dropped.
 
     Args:
         index:          Pre-built DocumentIndex (DocumentIndex.from_pdf(...)).
         question:       Natural-language question, e.g. "What is the base currency?"
         top_k:          Passages returned per search call.
-        max_iterations: Max agent steps (search calls + final answer).
+        max_iterations: Hard cap on agent steps (search calls + final answers).
+        min_searches:   Distinct search angles required before the agent may conclude.
+        min_references: Grounded references required before an answer is accepted.
+        max_nudges:     Max corrective feedback rounds when coverage falls short.
 
     Returns:
         QueryResult. result.answer is the value; result.references lists EVERY
@@ -291,11 +423,12 @@ def run_query(
 
     data: dict = {}
     try:
-        final_text = _run_agent_loop(
-            question, search_tool, max_iterations=max_iterations,
+        data = _run_agent_loop(
+            question, search_tool, pool, search_terms,
+            max_iterations=max_iterations, min_searches=min_searches,
+            min_references=min_references, max_nudges=max_nudges,
             llm_model=llm_model, base_url=base_url, api_key=api_key,
         )
-        data = _parse_final(final_text)
         print(f"      → Agent searched {len(search_terms)} time(s): {search_terms}")
         if not data:   # backend ignored tools / produced no JSON → single-shot
             print("      → No structured answer from loop; trying single-shot")
@@ -328,36 +461,14 @@ def run_query(
         print("      → No answer/references produced → Not found")
         return QueryResult(found=False, **base)
 
-    references: list[QueryReference] = []
-    seen: set[str] = set()
-    for quote, conf in quote_pairs:
-        grounded = _ground_reference(quote, pool)
-        if grounded is None:
-            print(f"      → Dropping ungrounded quote (possible hallucination): "
-                  f"{quote[:80]!r}")
-            continue
-        key = _normalize(quote)
-        if key in seen:                      # same proof quoted twice
-            continue
-        seen.add(key)
-        src_doc, src_score = grounded
-        references.append(QueryReference(
-            reference=str(quote),
-            confidence=conf,
-            heading=src_doc.metadata.get("heading"),
-            pages=src_doc.metadata.get("pages", []),
-            chunk_id=src_doc.metadata.get("chunk_id"),
-            score=float(src_score),
-        ))
+    references, dropped = _ground_quotes(quote_pairs, pool)
+    if dropped:
+        print(f"      → Dropped {dropped} ungrounded quote(s) (possible hallucination)")
 
     if not references:
         print("      → No quote grounded in any retrieved passage → Not found")
         return QueryResult(found=False, **{**base, "confidence": "low"})
 
-    # Rank references best first: high confidence, then highest similarity score.
-    _conf_rank = {"high": 0, "medium": 1, "low": 2}
-    references.sort(key=lambda r: (_conf_rank.get((r.confidence or "").lower(), 3),
-                                   -(r.score or 0.0)))
     best = references[0]
     print(f"      → Answer: {answer!r}  ({len(references)} grounded reference(s); "
           f"best in {best.heading!r}, confidence={best.confidence})")
