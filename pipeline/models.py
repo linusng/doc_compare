@@ -99,6 +99,21 @@ class ContentMatchResult(BaseModel):
         return [m.content for m in self.matches]
 
 
+class QueryReference(BaseModel):
+    """
+    One grounded reference supporting a run_query answer.
+
+    `reference` is always a verbatim (whitespace/case-insensitive) substring of the
+    source passage it is tied to — the grounding guard rejects anything else.
+    """
+    reference: str           # the verbatim quote from the document
+    confidence: str | None = None   # "high" | "medium" | "low" (LLM self-rated)
+    heading: str | None = None
+    pages: list = []
+    chunk_id: int | None = None
+    score: float | None = None
+
+
 class QueryResult(BaseModel):
     """
     Result of query mode (run_query): the answer to an open natural-language
@@ -106,25 +121,29 @@ class QueryResult(BaseModel):
 
     Unlike ContentMatchResult (which returns the passage matching a *description*),
     run_query answers a *question* ("What is the base currency?") and returns the
-    extracted VALUE ("USD") together with the verbatim REFERENCE phrase that proves
-    it ('"Base Currency" means Dollars ($)').
+    extracted VALUE ("USD") together with EVERY verbatim REFERENCE phrase that
+    proves it — the answer is often stated in a definition AND an operative clause.
 
-    Grounding guarantee: `reference` is always a verbatim substring of a retrieved
-    passage — the LLM may decide the answer, but the proof phrase is checked against
-    the source text. If the answer cannot be grounded, `found` is False, `answer`
-    and `reference` are None (the "return No" case). Check `result.found`.
+    Grounding guarantee: every entry in `references` is a verbatim substring of a
+    retrieved passage — the LLM may decide the answer, but each proof phrase is
+    checked against the source text. If nothing grounds, `found` is False and
+    `references` is empty (the "return No" case). Check `result.found`.
 
     Fields:
         answer       : the extracted value, e.g. "USD" / "English law". None if not found.
-        reference    : verbatim phrase from the document that supports the answer.
-        confidence   : "high" | "medium" | "low" — the LLM's self-rated certainty.
+        references   : ALL grounded references, ranked best (confidence, then score) first.
+        confidence   : overall self-rated certainty ("high"/"medium"/"low").
         reasoning    : short LLM rationale, kept for audit only.
         search_terms : the query strings the agent actually tried (refinement trail).
         supports     : every retrieved passage the answer draws on (list[ContentMatch]).
+    The single-value mirror fields (reference, heading, pages, chunk_id, score)
+    reflect references[0] (the best one), so older single-reference callers still work.
     """
     question: str
     found: bool = False
     answer: str | None = None
+    references: list[QueryReference] = []
+    # Best reference mirrored as flat fields — convenience for single-result use.
     reference: str | None = None
     heading: str | None = None
     pages: list = []
@@ -134,6 +153,14 @@ class QueryResult(BaseModel):
     reasoning: str | None = None
     search_terms: list[str] = []
     supports: list[ContentMatch] = []
+
+    @property
+    def answer_str(self) -> str:
+        return "" if self.answer is None else self.answer
+
+    def high_confidence_references(self) -> list["QueryReference"]:
+        """References the LLM rated 'high'."""
+        return [r for r in self.references if (r.confidence or "").lower() == "high"]
 
 
 class SectionEvidence(BaseModel):

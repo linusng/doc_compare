@@ -39,7 +39,7 @@ from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
 from .ingestion import DocumentIndex
-from .models import ContentMatch, QueryResult
+from .models import ContentMatch, QueryReference, QueryResult
 from .find_content import (
     materialize_candidate,
     retrieve_content_candidates,
@@ -136,13 +136,17 @@ _SYSTEM = (
     "3. Stop once you have found the answer or are confident it is not stated.\n\n"
     "Then give your FINAL answer as a single JSON object on one line, with keys:\n"
     '  "answer"     : the precise value, or null if not stated in the document.\n'
-    '  "reference"  : a VERBATIM quote copied EXACTLY from a retrieved passage '
-    "that contains the answer (do not paraphrase, do not invent), or null.\n"
-    '  "confidence" : "high" | "medium" | "low".\n'
+    '  "references" : a JSON array of EVERY passage that supports the answer — an '
+    "answer is often stated in a definition AND again in an operative clause; "
+    "include them ALL, not just one. Each array item is an object:\n"
+    '       {"quote": <VERBATIM text copied EXACTLY from a retrieved passage>, '
+    '"confidence": "high"|"medium"|"low"}\n'
+    '  "confidence" : overall "high" | "medium" | "low".\n'
     '  "reasoning"  : one short sentence.\n\n'
-    "The reference MUST be copied character-for-character from a passage the tool "
-    "returned. If you cannot find a supporting quote, set answer and reference to "
-    "null. Output ONLY the JSON object as your final message."
+    "Every quote MUST be copied character-for-character from a passage the tool "
+    "returned (do not paraphrase, do not invent). If you cannot find any supporting "
+    "quote, set answer to null and references to []. Output ONLY the JSON object as "
+    "your final message."
 )
 
 
@@ -158,6 +162,32 @@ def _parse_final(text: str) -> dict:
     except (json.JSONDecodeError, TypeError):
         pass
     return {}
+
+
+def _extract_quotes(data: dict) -> list[tuple[str, str | None]]:
+    """
+    Normalise the agent's answer into a list of (quote, confidence) pairs,
+    accepting both the new `references` array and a legacy singular `reference`.
+    """
+    pairs: list[tuple[str, str | None]] = []
+
+    refs = data.get("references")
+    if isinstance(refs, list):
+        for item in refs:
+            if isinstance(item, dict):
+                quote = item.get("quote") or item.get("reference")
+                conf = item.get("confidence")
+            else:
+                quote, conf = item, None
+            if quote:
+                pairs.append((str(quote), conf))
+
+    # Back-compat / fallback: a single top-level "reference" string.
+    legacy = data.get("reference")
+    if legacy and not pairs:
+        pairs.append((str(legacy), data.get("confidence")))
+
+    return pairs
 
 
 # ── Tool-calling loop (version-stable: langchain_core + langchain_openai only) ─
@@ -237,9 +267,11 @@ def run_query(
         max_iterations: Max agent steps (search calls + final answer).
 
     Returns:
-        QueryResult. result.found / result.answer / result.reference carry the
-        grounded answer; result.supports lists the retrieved passages; result
-        is the "No" case (found=False, answer=None) when nothing is grounded.
+        QueryResult. result.answer is the value; result.references lists EVERY
+        grounded supporting quote (ranked high-confidence first), with the best
+        mirrored into result.reference/heading/pages for single-result callers.
+        result.supports lists the retrieved passages. found=False (references
+        empty) is the "No" case — nothing could be grounded.
     """
     print(f"\n[query] Answering: '{question}'")
 
@@ -279,44 +311,68 @@ def run_query(
         )
 
     answer = (data.get("answer") or None)
-    reference = (data.get("reference") or None)
     confidence = data.get("confidence")
     reasoning = data.get("reasoning")
+    quote_pairs = _extract_quotes(data)
 
     supports = sorted(
         (_to_match(d, s, None) for d, s in pool.values()),
         key=lambda m: -(m.score or 0.0),
     )
 
-    # ── Grounding guard: the reference must be verbatim in a retrieved passage ──
-    if not answer or not reference:
-        print("      → No answer/reference produced → Not found")
-        return QueryResult(question=question, found=False, search_terms=search_terms,
-                           supports=supports, reasoning=reasoning, confidence=confidence)
+    base = dict(question=question, search_terms=search_terms, supports=supports,
+                reasoning=reasoning, confidence=confidence)
 
-    grounded = _ground_reference(reference, pool)
-    if grounded is None:
-        print(f"      → Reference not grounded in any retrieved passage "
-              f"(possible hallucination): {reference[:80]!r} → Not found")
-        return QueryResult(question=question, found=False, search_terms=search_terms,
-                           supports=supports, reasoning=reasoning, confidence="low")
+    # ── Grounding guard: every quote must be verbatim in a retrieved passage ──
+    if not answer or not quote_pairs:
+        print("      → No answer/references produced → Not found")
+        return QueryResult(found=False, **base)
 
-    src_doc, src_score = grounded
-    print(f"      → Answer: {answer!r}  (grounded in "
-          f"{src_doc.metadata.get('heading')!r}, confidence={confidence})")
+    references: list[QueryReference] = []
+    seen: set[str] = set()
+    for quote, conf in quote_pairs:
+        grounded = _ground_reference(quote, pool)
+        if grounded is None:
+            print(f"      → Dropping ungrounded quote (possible hallucination): "
+                  f"{quote[:80]!r}")
+            continue
+        key = _normalize(quote)
+        if key in seen:                      # same proof quoted twice
+            continue
+        seen.add(key)
+        src_doc, src_score = grounded
+        references.append(QueryReference(
+            reference=str(quote),
+            confidence=conf,
+            heading=src_doc.metadata.get("heading"),
+            pages=src_doc.metadata.get("pages", []),
+            chunk_id=src_doc.metadata.get("chunk_id"),
+            score=float(src_score),
+        ))
+
+    if not references:
+        print("      → No quote grounded in any retrieved passage → Not found")
+        return QueryResult(found=False, **{**base, "confidence": "low"})
+
+    # Rank references best first: high confidence, then highest similarity score.
+    _conf_rank = {"high": 0, "medium": 1, "low": 2}
+    references.sort(key=lambda r: (_conf_rank.get((r.confidence or "").lower(), 3),
+                                   -(r.score or 0.0)))
+    best = references[0]
+    print(f"      → Answer: {answer!r}  ({len(references)} grounded reference(s); "
+          f"best in {best.heading!r}, confidence={best.confidence})")
     return QueryResult(
-        question=question,
         found=True,
         answer=str(answer),
-        reference=str(reference),
-        heading=src_doc.metadata.get("heading"),
-        pages=src_doc.metadata.get("pages", []),
-        chunk_id=src_doc.metadata.get("chunk_id"),
-        score=float(src_score),
+        references=references,
+        # Mirror the best reference into the flat convenience fields.
+        reference=best.reference,
+        heading=best.heading,
+        pages=best.pages,
+        chunk_id=best.chunk_id,
+        score=best.score,
+        **{k: v for k, v in base.items() if k != "confidence"},
         confidence=confidence,
-        reasoning=reasoning,
-        search_terms=search_terms,
-        supports=supports,
     )
 
 
@@ -364,8 +420,10 @@ if __name__ == "__main__":
     idx = DocumentIndex.from_pdf(sys.argv[1])
     res = run_query(idx, sys.argv[2])
     print("\n" + "=" * 60)
-    print("ANSWER   :", res.answer if res.found else "(not found)")
-    print("REFERENCE:", res.reference)
-    print("HEADING  :", res.heading, res.pages)
+    print("ANSWER    :", res.answer if res.found else "(not found)")
     print("CONFIDENCE:", res.confidence)
-    print("TRIED    :", res.search_terms)
+    print(f"REFERENCES: {len(res.references)} grounded")
+    for i, ref in enumerate(res.references, 1):
+        print(f"  [{i}] ({ref.confidence}) {ref.heading} {ref.pages}")
+        print(f"      {ref.reference[:200]}")
+    print("TRIED     :", res.search_terms)
