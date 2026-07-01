@@ -105,6 +105,10 @@ class QueryReference(BaseModel):
 
     `reference` is always a verbatim (whitespace/case-insensitive) substring of the
     source passage it is tied to — the grounding guard rejects anything else.
+
+    `states_answer` is True when this passage literally contains the answer VALUE
+    (e.g. names the currency), as opposed to a supporting definition/operative
+    clause the answer was derived from. Such passages are ranked first.
     """
     reference: str           # the verbatim quote from the document
     confidence: str | None = None   # "high" | "medium" | "low" (LLM self-rated)
@@ -112,6 +116,7 @@ class QueryReference(BaseModel):
     pages: list = []
     chunk_id: int | None = None
     score: float | None = None
+    states_answer: bool = False
 
 
 class QueryResult(BaseModel):
@@ -161,6 +166,10 @@ class QueryResult(BaseModel):
     def high_confidence_references(self) -> list["QueryReference"]:
         """References the LLM rated 'high'."""
         return [r for r in self.references if (r.confidence or "").lower() == "high"]
+
+    def answer_references(self) -> list["QueryReference"]:
+        """References whose passage literally states the answer value."""
+        return [r for r in self.references if r.states_answer]
 
 
 class SectionEvidence(BaseModel):

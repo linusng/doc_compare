@@ -21,16 +21,20 @@ until it can answer or it gives up. It returns two things, not one:
 
 Grounding guard (anti-hallucination)
 -------------------------------------
-Whatever the agent answers, the returned `reference` is checked DETERMINISTICALLY
-against the passages that were actually retrieved: it must be a (whitespace-
-normalised) verbatim substring of one of them. If it is not, the answer is not
-grounded and the result is found=False. This mirrors evidence.py's "the agent
+Whatever the agent answers, each returned `reference` is checked DETERMINISTICALLY:
+it must be a normalised verbatim substring of a document passage. Matching first
+tries the retrieved pool (so references keep a similarity score) and then falls
+back to the WHOLE document, so a genuine quote from a passage the agent never
+retrieved still grounds. Normalisation (see _normalize) forgives only cosmetic
+encoding differences — smart quotes, dashes, ligatures, whitespace, casing — never
+paraphrase. If nothing grounds, found=False. This mirrors evidence.py's "the agent
 decides, the code enforces truth" guarantee and extract.py's rule that the LLM
 never invents document text.
 """
 
 import json
 import re
+import unicodedata
 
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -45,35 +49,87 @@ from .find_content import (
     retrieve_content_candidates,
     _to_match,
 )
+from .section_utils import chunk_to_doc
 
 
 # ── Grounding (deterministic verbatim check) ──────────────────────────────────
 
+# Punctuation variants that are visually/semantically identical but differ in
+# code point — the commonest cause of a real quote failing to ground. Mapped to a
+# single canonical form so both the quote and the source text agree. Applied to
+# BOTH sides, so this only makes genuinely-identical text match; it can never turn
+# a paraphrase into a match.
+_PUNCT_MAP = {
+    # single quotes / apostrophes → '
+    "‘": "'", "’": "'", "‚": "'", "‛": "'", "′": "'",
+    "`": "'", "´": "'",
+    # double quotes → "
+    "“": '"', "”": '"', "„": '"', "‟": '"', "″": '"',
+    "«": '"', "»": '"',
+    # dashes / minus → -
+    "‐": "-", "‑": "-", "‒": "-", "–": "-", "—": "-",
+    "―": "-", "−": "-",
+    # zero-width / soft hyphen / BOM → removed
+    "­": "", "​": "", "‌": "", "‍": "", "﻿": "",
+    # ellipsis → three dots (so "…" and "..." agree)
+    "…": "...",
+}
+_PUNCT_TABLE = str.maketrans(_PUNCT_MAP)
+
+
 def _normalize(text: str) -> str:
-    """Collapse whitespace and lowercase so a quote survives reflow/casing."""
-    return re.sub(r"\s+", " ", text or "").strip().lower()
+    """
+    Canonicalise text for grounding comparisons: NFKC-normalise (folds ligatures,
+    full-width forms, non-breaking spaces, etc.), unify punctuation variants
+    (smart quotes, en/em dashes, soft hyphens, ellipsis), collapse whitespace and
+    lowercase. Applied identically to both the quote and the source, so a match
+    still means the text is genuinely the same — only cosmetic encoding
+    differences are forgiven.
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(_PUNCT_TABLE)
+    return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def _ground_reference(
     reference: str,
     pool: dict[int, tuple[Document, float]],
-) -> tuple[Document, float] | None:
+    whole_doc: list[tuple[Document, str]] | None = None,
+) -> tuple[Document, float | None] | None:
     """
-    Return the (doc, score) whose text verbatim-contains `reference`
-    (whitespace-insensitive), or None if the quote is not grounded anywhere.
+    Return the (doc, score) whose text verbatim-contains `reference` (after
+    normalisation), or None if the quote is not grounded anywhere.
 
-    The longest reference that still matches wins implicitly: we only accept an
-    exact normalised substring, so a hallucinated/paraphrased quote fails.
+    We only accept an exact normalised substring, so a hallucinated/paraphrased
+    quote fails — but normalisation (see _normalize) forgives cosmetic encoding
+    differences (smart quotes, dashes, whitespace, casing, ligatures).
+
+    Grounding is checked in two tiers:
+      1. `pool` — the passages the agent's searches actually retrieved. A hit here
+         carries its similarity score (preferred, so references keep a score).
+      2. `whole_doc` — every chunk of the document, precomputed as
+         (Document, normalised_text). This catches a genuine quote that lives in a
+         passage the agent never happened to retrieve. A whole-doc-only hit has no
+         similarity score (score=None); it is still a verbatim match.
     """
     needle = _normalize(reference)
     if len(needle) < 4:        # too short to be a meaningful, unique proof
         return None
+
     best: tuple[Document, float] | None = None
     for doc, score in pool.values():
         if needle in _normalize(doc.page_content):
             if best is None or score > best[1]:
                 best = (doc, score)
-    return best
+    if best is not None:
+        return best
+
+    # Tier 2: whole-document fallback (normalised text precomputed by caller).
+    if whole_doc:
+        for doc, norm_text in whole_doc:
+            if needle in norm_text:
+                return (doc, None)
+    return None
 
 
 # ── Search tool (what the agent drives) ───────────────────────────────────────
@@ -141,7 +197,10 @@ _SYSTEM = (
     '  "answer"     : the precise value, or null if not stated in the document.\n'
     '  "references" : a JSON array of EVERY passage that supports the answer — an '
     "answer is often stated in a definition AND again in an operative clause; "
-    "include them ALL, not just one. Each array item is an object:\n"
+    "include them ALL, not just one. You MUST include the passage that DIRECTLY "
+    "STATES the answer value (e.g. the exact text naming the currency / amount / "
+    "date), quoted verbatim — do not cite only the surrounding definition or "
+    "operative clauses. Each array item is an object:\n"
     '       {"quote": <VERBATIM text copied EXACTLY from a retrieved passage>, '
     '"confidence": "high"|"medium"|"low"}\n'
     '  "confidence" : overall "high" | "medium" | "low".\n'
@@ -199,10 +258,12 @@ _CONF_RANK = {"high": 0, "medium": 1, "low": 2}
 def _ground_quotes(
     quote_pairs: list[tuple[str, str | None]],
     pool: dict[int, tuple[Document, float]],
+    whole_doc: list[tuple[Document, str]] | None = None,
 ) -> tuple[list[QueryReference], int]:
     """
-    Ground every quote against the retrieved pool, deduping and ranking the
-    survivors (high confidence first, then similarity score).
+    Ground every quote against the retrieved pool (and, as a fallback, the whole
+    document), deduping and ranking the survivors (high confidence first, then
+    similarity score).
 
     Returns (references, dropped) where `dropped` counts quotes that did NOT
     ground verbatim — the loop uses that signal to ask the agent to re-quote.
@@ -211,7 +272,7 @@ def _ground_quotes(
     seen: set[str] = set()
     dropped = 0
     for quote, conf in quote_pairs:
-        grounded = _ground_reference(quote, pool)
+        grounded = _ground_reference(quote, pool, whole_doc)
         if grounded is None:
             dropped += 1
             continue
@@ -226,11 +287,126 @@ def _ground_quotes(
             heading=src_doc.metadata.get("heading"),
             pages=src_doc.metadata.get("pages", []),
             chunk_id=src_doc.metadata.get("chunk_id"),
-            score=float(src_score),
+            score=(None if src_score is None else float(src_score)),
         ))
     references.sort(key=lambda r: (_CONF_RANK.get((r.confidence or "").lower(), 3),
                                    -(r.score or 0.0)))
     return references, dropped
+
+
+# ── Answer-passage augmentation (Option 1) ────────────────────────────────────
+#
+# The LLM's `references` are the quotes IT chose to cite; it systematically
+# under-cites, often quoting the surrounding definition/operative clauses while
+# omitting the passage that literally states the value — even when that passage
+# was retrieved with the HIGHEST similarity score. This step guarantees the
+# answer-stating passage(s) are cited: it scans the retrieved pool (and, as a
+# fallback, the whole document) for the answer value and folds the top matches in.
+
+def _answer_variants(answer: str) -> list[str]:
+    """
+    The answer value plus light variants to look for in passage text:
+    the value itself, any parenthetical abbreviation ("Singapore Dollars (SGD)"
+    → "SGD"), and the value with the parenthetical stripped. Variants shorter than
+    3 normalised chars are dropped to avoid spurious substring hits.
+    """
+    answer = (answer or "").strip()
+    variants = {answer} if answer else set()
+    m = re.search(r"\(([^)]+)\)", answer)
+    if m:
+        variants.add(m.group(1).strip())
+    stripped = re.sub(r"\s*\([^)]*\)\s*", " ", answer).strip()
+    if stripped:
+        variants.add(stripped)
+    return [v for v in variants if len(_normalize(v)) >= 3]
+
+
+def _snippet_containing(text: str, needles: list[str]) -> str:
+    """
+    Return the first sentence/line of `text` that contains one of `needles`
+    (normalised) as a focused verbatim quote; fall back to the whole passage.
+    The result is a substring of `text`, so it stays verbatim/grounded.
+    """
+    for part in re.split(r"\n+|(?<=[.;])\s+", text):
+        part_norm = _normalize(part)
+        if any(n in part_norm for n in needles) and part.strip():
+            return part.strip()
+    return text.strip()
+
+
+def _augment_answer_references(
+    answer: str,
+    references: list[QueryReference],
+    pool: dict[int, tuple[Document, float]],
+    whole_doc: list[tuple[Document, str]] | None,
+    max_add: int,
+) -> int:
+    """
+    Ensure passages that VERBATIM state the answer value are cited.
+
+    - Marks any already-cited chunk that states the answer with states_answer=True.
+    - Appends up to `max_add` highest-scoring un-cited passages that state the
+      answer (pool matches, which keep their score, before score-less whole-doc
+      matches), each as a focused snippet.
+
+    Returns the number of references added. No-op when the answer value is not
+    verbatim anywhere (e.g. a derived value like "Singapore Dollars" when the doc
+    only says "the lawful currency of Singapore").
+    """
+    needles = [_normalize(v) for v in _answer_variants(answer)]
+    if not needles:
+        return 0
+
+    def _hit(text_norm: str) -> bool:
+        return any(n in text_norm for n in needles)
+
+    referenced_chunks = {r.chunk_id for r in references if r.chunk_id is not None}
+    ref_by_chunk = {r.chunk_id: r for r in references if r.chunk_id is not None}
+
+    # Answer-stating passages: pool first (scored, keep best score per chunk)…
+    matches: dict[int, tuple[Document, float | None]] = {}
+    for doc, score in pool.values():
+        cid = doc.metadata.get("chunk_id")
+        if cid is None or not _hit(_normalize(doc.page_content)):
+            continue
+        prev = matches.get(cid)
+        if prev is None or (prev[1] or -1.0) < (score or -1.0):
+            matches[cid] = (doc, score)
+    # …then whole-document fallback (score-less) for chunks not already found.
+    if whole_doc:
+        for doc, norm in whole_doc:
+            cid = doc.metadata.get("chunk_id")
+            if cid is None or cid in matches:
+                continue
+            if _hit(norm):
+                matches[cid] = (doc, None)
+
+    # Mark cited chunks that state the answer; queue the rest for adding.
+    to_add: list[tuple[Document, float | None]] = []
+    for cid, (doc, score) in matches.items():
+        if cid in referenced_chunks:
+            r = ref_by_chunk.get(cid)
+            if r is not None:
+                r.states_answer = True
+        else:
+            to_add.append((doc, score))
+
+    # Highest-scoring first; score-less whole-doc matches last.
+    to_add.sort(key=lambda ds: (ds[1] is None, -(ds[1] or 0.0)))
+
+    added = 0
+    for doc, score in to_add[:max_add]:
+        references.append(QueryReference(
+            reference=_snippet_containing(doc.page_content, needles),
+            confidence="high",
+            heading=doc.metadata.get("heading"),
+            pages=doc.metadata.get("pages", []),
+            chunk_id=doc.metadata.get("chunk_id"),
+            score=(None if score is None else float(score)),
+            states_answer=True,
+        ))
+        added += 1
+    return added
 
 
 # ── Tool-calling loop (version-stable: langchain_core + langchain_openai only) ─
@@ -245,6 +421,7 @@ def _coverage_feedback(
     n_distinct_searches: int,
     min_searches: int,
     min_references: int,
+    whole_doc: list[tuple[Document, str]] | None = None,
 ) -> str | None:
     """
     Decide whether the agent's proposed final answer is good enough to accept.
@@ -258,7 +435,7 @@ def _coverage_feedback(
     """
     answer = data.get("answer") or None
     quote_pairs = _extract_quotes(data)
-    references, dropped = _ground_quotes(quote_pairs, pool)
+    references, dropped = _ground_quotes(quote_pairs, pool, whole_doc)
 
     problems: list[str] = []
 
@@ -305,6 +482,7 @@ def _run_agent_loop(
     llm_model: str,
     base_url: str,
     api_key: str,
+    whole_doc: list[tuple[Document, str]] | None = None,
 ) -> dict:
     """
     Self-correcting tool-calling loop.
@@ -350,7 +528,7 @@ def _run_agent_loop(
 
         n_distinct = len({_normalize(t) for t in search_terms})
         feedback = _coverage_feedback(
-            data, pool, n_distinct, min_searches, min_references,
+            data, pool, n_distinct, min_searches, min_references, whole_doc,
         )
         if feedback is None or nudges_used >= max_nudges:
             break  # accept the answer
@@ -372,6 +550,7 @@ def run_query(
     min_searches: int = 2,
     min_references: int = 1,
     max_nudges: int = 3,
+    max_answer_refs: int = 3,
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
@@ -387,7 +566,12 @@ def run_query(
        fewer references than required, it is nudged with specific feedback and
        keeps going (up to max_nudges corrective rounds).
     3. Every surviving quote is verified deterministically against the retrieved
-       passages; ungrounded (hallucinated/paraphrased) quotes are dropped.
+       passages and, as a fallback, the whole document; only quotes that are not a
+       verbatim (encoding-normalised) match anywhere are dropped.
+    4. Answer-passage augmentation: the passage(s) that literally state the answer
+       value are guaranteed to be cited (marked states_answer=True and ranked
+       first), even if the model under-cited and omitted them — up to
+       max_answer_refs high-scoring passages are folded in.
 
     Args:
         index:          Pre-built DocumentIndex (DocumentIndex.from_pdf(...)).
@@ -397,11 +581,13 @@ def run_query(
         min_searches:   Distinct search angles required before the agent may conclude.
         min_references: Grounded references required before an answer is accepted.
         max_nudges:     Max corrective feedback rounds when coverage falls short.
+        max_answer_refs: Max answer-stating passages to fold in (step 4). 0 disables.
 
     Returns:
         QueryResult. result.answer is the value; result.references lists EVERY
-        grounded supporting quote (ranked high-confidence first), with the best
-        mirrored into result.reference/heading/pages for single-result callers.
+        grounded supporting quote — passages that literally state the answer
+        (states_answer=True) ranked first, then by confidence and score — with the
+        best mirrored into result.reference/heading/pages for single-result callers.
         result.supports lists the retrieved passages. found=False (references
         empty) is the "No" case — nothing could be grounded.
     """
@@ -410,6 +596,14 @@ def run_query(
     pool: dict[int, tuple[Document, float]] = {}
     search_terms: list[str] = []
     search_tool = _make_search_tool(index, pool, search_terms, top_k)
+
+    # Whole-document haystack for the grounding fallback (F): normalise every
+    # chunk once so a genuine quote from a passage the agent never retrieved can
+    # still be grounded. Precomputed here to avoid re-normalising on each check.
+    whole_doc: list[tuple[Document, str]] = [
+        (doc, _normalize(doc.page_content))
+        for doc in (chunk_to_doc(c) for c in index.chunks)
+    ]
 
     # Seed the pool so we still have candidates to ground against / fall back on
     # even if the agent never calls the tool.
@@ -428,6 +622,7 @@ def run_query(
             max_iterations=max_iterations, min_searches=min_searches,
             min_references=min_references, max_nudges=max_nudges,
             llm_model=llm_model, base_url=base_url, api_key=api_key,
+            whole_doc=whole_doc,
         )
         print(f"      → Agent searched {len(search_terms)} time(s): {search_terms}")
         if not data:   # backend ignored tools / produced no JSON → single-shot
@@ -456,17 +651,31 @@ def run_query(
     base = dict(question=question, search_terms=search_terms, supports=supports,
                 reasoning=reasoning, confidence=confidence)
 
-    # ── Grounding guard: every quote must be verbatim in a retrieved passage ──
-    if not answer or not quote_pairs:
-        print("      → No answer/references produced → Not found")
+    # ── Grounding guard: every quote must be verbatim in a document passage ──
+    if not answer:
+        print("      → No answer produced → Not found")
         return QueryResult(found=False, **base)
 
-    references, dropped = _ground_quotes(quote_pairs, pool)
+    references, dropped = _ground_quotes(quote_pairs, pool, whole_doc)
     if dropped:
         print(f"      → Dropped {dropped} ungrounded quote(s) (possible hallucination)")
 
+    # Option 1: guarantee the passage(s) that literally state the answer are cited,
+    # even if the model under-cited and omitted the highest-scoring one.
+    if max_answer_refs > 0:
+        added = _augment_answer_references(
+            answer, references, pool, whole_doc, max_answer_refs,
+        )
+        if added:
+            print(f"      → Added {added} answer-stating passage(s) the model omitted")
+
+    # Rank: answer-stating passages first, then confidence, then similarity score.
+    references.sort(key=lambda r: (not r.states_answer,
+                                   _CONF_RANK.get((r.confidence or "").lower(), 3),
+                                   -(r.score or 0.0)))
+
     if not references:
-        print("      → No quote grounded in any retrieved passage → Not found")
+        print("      → No quote grounded anywhere in the document → Not found")
         return QueryResult(found=False, **{**base, "confidence": "low"})
 
     best = references[0]
@@ -535,6 +744,8 @@ if __name__ == "__main__":
     print("CONFIDENCE:", res.confidence)
     print(f"REFERENCES: {len(res.references)} grounded")
     for i, ref in enumerate(res.references, 1):
-        print(f"  [{i}] ({ref.confidence}) {ref.heading} {ref.pages}")
+        star = " ★states-answer" if ref.states_answer else ""
+        score = "n/a" if ref.score is None else f"{ref.score:.3f}"
+        print(f"  [{i}] ({ref.confidence}, score={score}){star} {ref.heading} {ref.pages}")
         print(f"      {ref.reference[:200]}")
     print("TRIED     :", res.search_terms)
