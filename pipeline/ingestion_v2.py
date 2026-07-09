@@ -45,6 +45,7 @@ so every downstream module (extract/collate/query/find_content) works as-is.
 
 import json
 import re
+import traceback
 from dataclasses import dataclass
 
 import pymupdf
@@ -247,13 +248,22 @@ def _segment_window(
     base_url: str,
     api_key: str,
     max_steps: int = 3,
+    verbose: bool = True,
+    window_no: int = 0,
 ) -> list[dict]:
     """
     Ask the agent to mark section starts within one window via the emit_section
     tool. Returns boundary dicts whose line id falls inside the window (clamped so
     the model can't reference lines it wasn't shown). Falls back to JSON parsing
     if the backend doesn't call tools.
+
+    With verbose=True, prints per-window diagnostics: how many tool calls the model
+    made, how many boundaries were recorded, and — when nothing was recorded — the
+    raw model output, so you can see WHY a window produced no sections.
     """
+    span = (f"lines {window[0].index}-{window[-1].index}, "
+            f"p{window[0].page}-{window[-1].page}") if window else "empty"
+
     recorded: list[dict] = []
     tool = _emit_section_tool(recorded)
     llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
@@ -266,6 +276,7 @@ def _segment_window(
     messages: list = [SystemMessage(content=_SEG_SYSTEM), HumanMessage(content=human)]
 
     last_text = ""
+    total_tool_calls = 0
     for _ in range(max_steps):
         ai: AIMessage = llm_with_tools.invoke(messages)
         messages.append(ai)
@@ -274,6 +285,7 @@ def _segment_window(
         tool_calls = getattr(ai, "tool_calls", None)
         if not tool_calls:
             break
+        total_tool_calls += len(tool_calls)
         for call in tool_calls:
             try:
                 obs = tool.invoke(call["args"])
@@ -281,11 +293,27 @@ def _segment_window(
                 obs = f"error: {exc}"
             messages.append(ToolMessage(content=str(obs), tool_call_id=call["id"]))
 
+    used_json_fallback = False
     if not recorded:
         recorded = _parse_boundaries_json(last_text)
+        used_json_fallback = bool(recorded)
 
     valid_ids = {ln.index for ln in window}
-    return [b for b in recorded if b["line"] in valid_ids]
+    kept = [b for b in recorded if b["line"] in valid_ids]
+
+    if verbose:
+        print(f"      → [seg] window {window_no} ({span}): "
+              f"tool_calls={total_tool_calls}, recorded={len(recorded)}"
+              f"{' via JSON-fallback' if used_json_fallback else ''}, "
+              f"kept-in-window={len(kept)}")
+        if total_tool_calls == 0 and not recorded:
+            # The decisive diagnostic: the model neither called the tool nor
+            # produced parseable JSON. Show what it actually said.
+            preview = (last_text or "(empty response)").strip().replace("\n", " ")
+            print(f"           ↳ model did NOT call emit_section. Raw output: "
+                  f"{preview[:300]!r}")
+
+    return kept
 
 
 def segment_document(
@@ -293,6 +321,7 @@ def segment_document(
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
+    verbose: bool = True,
 ) -> list[dict]:
     """
     Walk the whole document window-by-window, carrying the last known section
@@ -301,15 +330,20 @@ def segment_document(
     boundaries: list[dict] = []
     prior_heading = "(start of document)"
     n_windows = 0
+    windows_with_tool_calls = 0
     for window in _iter_windows(lines):
         n_windows += 1
         found = _segment_window(
-            window, prior_heading, llm_model=llm_model, base_url=base_url, api_key=api_key,
+            window, prior_heading, llm_model=llm_model, base_url=base_url,
+            api_key=api_key, verbose=verbose, window_no=n_windows,
         )
+        if found:
+            windows_with_tool_calls += 1
         boundaries.extend(found)
         if found:
             prior_heading = found[-1].get("heading") or prior_heading
-    print(f"      → Segmented {n_windows} window(s) → {len(boundaries)} section boundary(ies)")
+    print(f"      → Segmented {n_windows} window(s) → {len(boundaries)} section "
+          f"boundary(ies) from {windows_with_tool_calls} productive window(s)")
     return boundaries
 
 
@@ -457,6 +491,8 @@ class DocumentIndexV2(DocumentIndex):
         api_key: str = "ollama",
         embedding_model: str = "bge-m3",
         target_chunk_tokens: int = TARGET_CHUNK_TOKENS,
+        verbose: bool = True,
+        allow_fallback: bool = True,
     ) -> "DocumentIndexV2":
         """
         Build a DocumentIndex using LLM-driven section parsing.
@@ -465,6 +501,11 @@ class DocumentIndexV2(DocumentIndex):
         2. Agentically segment into sections (with heuristic fallback).
         3. Reconstruct SectionChunks verbatim at the boundaries.
         4. Token-safe split + vector store — identical to v1 from here on.
+
+        verbose        : print per-window segmentation diagnostics (default True).
+        allow_fallback : if False, raise instead of silently falling back to the
+                         heuristic BLOCK chunker — use this to surface the real
+                         segmentation error while debugging.
         """
         print(f"[1/4] Extracting reading-order lines from: {pdf_path}")
         lines = extract_page_lines(pdf_path)
@@ -472,18 +513,45 @@ class DocumentIndexV2(DocumentIndex):
 
         print("[2/4] Agentic section segmentation (LLM + emit_section tool)...")
         sections: list[SectionChunk] = []
+        seg_error: Exception | None = None
         try:
             boundaries = segment_document(
                 lines, llm_model=llm_model, base_url=base_url, api_key=api_key,
+                verbose=verbose,
             )
             sections = build_sections(lines, boundaries)
+            print(f"      → LLM segmentation produced {len(sections)} section(s)")
         except Exception as exc:   # noqa: BLE001 — backend/tooling unavailable
-            print(f"      → Segmentation failed ({type(exc).__name__}: {exc})")
+            seg_error = exc
+            print(f"      → ✗ Segmentation RAISED {type(exc).__name__}: {exc}")
+            if verbose:
+                traceback.print_exc()
 
         if len(sections) < 2:
-            print("      → Too few sections from LLM; falling back to heuristic chunker")
+            # Spell out exactly why we are about to use the block-based chunker.
+            if seg_error is not None:
+                reason = (f"segmentation raised {type(seg_error).__name__} — the "
+                          f"LLM/tool backend errored (see traceback above). Common "
+                          f"cause: the endpoint/model does not support tool calling.")
+            else:
+                reason = ("segmentation ran but returned too few boundaries "
+                          f"({len(sections)} section(s)) — the model did not call "
+                          f"emit_section (see per-window raw output above). Common "
+                          f"cause: the model ignores bound tools, or the headings "
+                          f"weren't recognised.")
+            print(f"      → ⚠  FALLBACK TRIGGERED — reason: {reason}")
+            if not allow_fallback:
+                raise RuntimeError(
+                    f"v2 segmentation failed and allow_fallback=False: {reason}"
+                ) from seg_error
+            print("      → ⚠  USING HEURISTIC BLOCK CHUNKER (this is the v1 "
+                  "block-based path — NOT the smart LLM sections)")
             sections = _heuristic_chunks(pdf_path, llm_model, base_url, api_key)
-        print(f"      → {len(sections)} section(s)")
+            print(f"      → Heuristic fallback produced {len(sections)} "
+                  f"block-based section(s)")
+        else:
+            print(f"      → ✓ Using {len(sections)} LLM-parsed section(s) "
+                  f"(smart indexing)")
 
         print("[3/4] Splitting oversized chunks...")
         chunks = split_oversized_chunks(sections, max_tokens=target_chunk_tokens)
