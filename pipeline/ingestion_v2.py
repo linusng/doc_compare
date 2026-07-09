@@ -68,11 +68,13 @@ from .ingestion import (
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
-# A window is the slice of lines shown to the LLM in one segmentation call. Kept
-# well under the context limit so the model reads every line carefully. Windows
-# are cut on line boundaries once either budget is hit.
-WINDOW_TARGET_TOKENS = 1400
-WINDOW_MAX_LINES = 120
+# A window is the slice of lines shown to the LLM in ONE segmentation call. Bigger
+# windows mean fewer LLM calls (lower RPM, faster) — the cost is a longer prompt
+# per call, which modern models handle easily. These are the primary speed knobs;
+# raise WINDOW_TARGET_TOKENS to cut the request count further (bounded by the
+# model's usable context). Tune via DocumentIndexV2.from_pdf(window_target_tokens=).
+WINDOW_TARGET_TOKENS = 4000
+WINDOW_MAX_LINES = 400
 
 # Running header/footer suppression: a short line whose text repeats on at least
 # this many pages is treated as a running artefact (page number, running title).
@@ -145,16 +147,21 @@ def _format_window(window: list[Line]) -> str:
     return "\n".join(f"[{ln.index}] (p{ln.page}) {ln.text}" for ln in window)
 
 
-def _iter_windows(lines: list[Line]):
+def _iter_windows(
+    lines: list[Line],
+    target_tokens: int = WINDOW_TARGET_TOKENS,
+    max_lines: int = WINDOW_MAX_LINES,
+):
     """Yield contiguous windows of lines, cut on a line boundary once the token
-    budget or line cap is reached."""
+    budget or line cap is reached. Larger target_tokens → fewer windows → fewer
+    LLM calls."""
     start = 0
     n = len(lines)
     while start < n:
         end = start
-        while end < n and (end - start) < WINDOW_MAX_LINES:
+        while end < n and (end - start) < max_lines:
             trial = lines[start:end + 1]
-            if end > start and token_len(_format_window(trial)) > WINDOW_TARGET_TOKENS:
+            if end > start and token_len(_format_window(trial)) > target_tokens:
                 break
             end += 1
         yield lines[start:max(end, start + 1)]
@@ -247,7 +254,7 @@ def _segment_window(
     llm_model: str,
     base_url: str,
     api_key: str,
-    max_steps: int = 3,
+    max_steps: int = 1,
     verbose: bool = True,
     window_no: int = 0,
 ) -> list[dict]:
@@ -256,6 +263,11 @@ def _segment_window(
     tool. Returns boundary dicts whose line id falls inside the window (clamped so
     the model can't reference lines it wasn't shown). Falls back to JSON parsing
     if the backend doesn't call tools.
+
+    Cost: exactly `max_steps` LLM calls per window (default 1). A tool-capable
+    model emits ALL its emit_section calls in a single response, so one call is
+    enough and there is no extra "finishing" round-trip. Raise max_steps only if
+    your model splits tool calls across turns.
 
     With verbose=True, prints per-window diagnostics: how many tool calls the model
     made, how many boundaries were recorded, and — when nothing was recorded — the
@@ -277,7 +289,7 @@ def _segment_window(
 
     last_text = ""
     total_tool_calls = 0
-    for _ in range(max_steps):
+    for step in range(max_steps):
         ai: AIMessage = llm_with_tools.invoke(messages)
         messages.append(ai)
         if ai.content:
@@ -286,12 +298,17 @@ def _segment_window(
         if not tool_calls:
             break
         total_tool_calls += len(tool_calls)
+        # Execute the tool calls (side effect: populate `recorded`). We only send
+        # results back and re-invoke if the caller allows more steps — otherwise
+        # one call already gave us every section in this window.
         for call in tool_calls:
             try:
                 obs = tool.invoke(call["args"])
             except Exception as exc:   # noqa: BLE001 — bad args from the model
                 obs = f"error: {exc}"
             messages.append(ToolMessage(content=str(obs), tool_call_id=call["id"]))
+        if step + 1 >= max_steps:
+            break
 
     used_json_fallback = False
     if not recorded:
@@ -322,27 +339,34 @@ def segment_document(
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
     verbose: bool = True,
+    window_target_tokens: int = WINDOW_TARGET_TOKENS,
+    max_steps: int = 1,
 ) -> list[dict]:
     """
     Walk the whole document window-by-window, carrying the last known section
     heading as context, and collect all section boundaries.
+
+    Makes exactly one window list up front so the LLM-call budget (= number of
+    windows × max_steps) is known and printed before any calls are made.
     """
+    windows = list(_iter_windows(lines, target_tokens=window_target_tokens))
+    print(f"      → {len(windows)} window(s) → up to {len(windows) * max_steps} "
+          f"LLM call(s) (window_target_tokens={window_target_tokens}, "
+          f"max_steps={max_steps})")
+
     boundaries: list[dict] = []
     prior_heading = "(start of document)"
-    n_windows = 0
     windows_with_tool_calls = 0
-    for window in _iter_windows(lines):
-        n_windows += 1
+    for i, window in enumerate(windows, start=1):
         found = _segment_window(
             window, prior_heading, llm_model=llm_model, base_url=base_url,
-            api_key=api_key, verbose=verbose, window_no=n_windows,
+            api_key=api_key, verbose=verbose, window_no=i, max_steps=max_steps,
         )
         if found:
             windows_with_tool_calls += 1
-        boundaries.extend(found)
-        if found:
             prior_heading = found[-1].get("heading") or prior_heading
-    print(f"      → Segmented {n_windows} window(s) → {len(boundaries)} section "
+        boundaries.extend(found)
+    print(f"      → Segmented {len(windows)} window(s) → {len(boundaries)} section "
           f"boundary(ies) from {windows_with_tool_calls} productive window(s)")
     return boundaries
 
@@ -493,6 +517,8 @@ class DocumentIndexV2(DocumentIndex):
         target_chunk_tokens: int = TARGET_CHUNK_TOKENS,
         verbose: bool = True,
         allow_fallback: bool = True,
+        window_target_tokens: int = WINDOW_TARGET_TOKENS,
+        segmentation_max_steps: int = 1,
     ) -> "DocumentIndexV2":
         """
         Build a DocumentIndex using LLM-driven section parsing.
@@ -506,6 +532,10 @@ class DocumentIndexV2(DocumentIndex):
         allow_fallback : if False, raise instead of silently falling back to the
                          heuristic BLOCK chunker — use this to surface the real
                          segmentation error while debugging.
+        window_target_tokens : lines per LLM segmentation call. Larger → fewer
+                         windows → fewer LLM calls (lower RPM, faster). Default 4000.
+        segmentation_max_steps : LLM calls per window (default 1). One is enough
+                         for models that emit all tool calls in a single response.
         """
         print(f"[1/4] Extracting reading-order lines from: {pdf_path}")
         lines = extract_page_lines(pdf_path)
@@ -517,7 +547,8 @@ class DocumentIndexV2(DocumentIndex):
         try:
             boundaries = segment_document(
                 lines, llm_model=llm_model, base_url=base_url, api_key=api_key,
-                verbose=verbose,
+                verbose=verbose, window_target_tokens=window_target_tokens,
+                max_steps=segmentation_max_steps,
             )
             sections = build_sections(lines, boundaries)
             print(f"      → LLM segmentation produced {len(sections)} section(s)")
