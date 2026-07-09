@@ -132,6 +132,118 @@ def _ground_reference(
     return None
 
 
+# ── Query-term extraction (coverage for long queries) ─────────────────────────
+#
+# A long question ("In computing the leverage ratio, how is Adjusted EBITDA
+# defined and what add-backs are permitted?") embeds as one vector dominated by
+# its bulk, so a nested key term like "Adjusted EBITDA" may not score high enough
+# for its defining chunk to be retrieved at all — and a chunk that is never
+# retrieved can never be cited. We extract the key terms and run a FOCUSED search
+# per term, seeding the pool with those high-score chunks. A deterministic
+# heuristic catches capitalised/acronym terms for free; the LLM extractor
+# (reused from collate) adds semantic terms the heuristic misses.
+
+# Question words and connectives that are never useful as standalone search terms.
+_QUESTION_STOPWORDS = {
+    "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+    "is", "are", "was", "were", "be", "been", "being", "the", "a", "an", "of",
+    "in", "on", "for", "to", "and", "or", "does", "do", "did", "will", "shall",
+    "can", "could", "would", "should", "this", "that", "these", "those",
+    "under", "per", "by", "with", "as", "at", "from", "any", "used",
+}
+
+# Runs of capitalised words / ALL-CAPS acronyms — e.g. "Adjusted EBITDA",
+# "Final Maturity Date", "SONIA". Every token in the run must be capitalised or an
+# acronym; lowercase connectives break the run (so "SONIA for GBP" → "SONIA",
+# "GBP", not one glued term).
+_CAP_RUN_RE = re.compile(
+    r"\b(?:[A-Z][A-Za-z0-9&/.-]+|[A-Z]{2,})"
+    r"(?:\s+(?:[A-Z][A-Za-z0-9&/.-]+|[A-Z]{2,}))*"
+)
+_QUOTED_RE = re.compile(r"[\"“'‘]([^\"”'’]{2,60})[\"”'’]")
+
+
+def _heuristic_key_terms(question: str) -> list[str]:
+    """
+    Deterministically pull nested key terms from the question: quoted phrases,
+    multi-word capitalised phrases, and ALL-CAPS acronyms. Leading/trailing
+    question stopwords are trimmed (so "What" in "What is Adjusted EBITDA" is
+    dropped). Single capitalised common words are NOT kept — those are left to the
+    LLM extractor — to avoid seeding noise.
+    """
+    terms: list[str] = []
+
+    for m in _QUOTED_RE.finditer(question):
+        phrase = m.group(1).strip()
+        if phrase:
+            terms.append(phrase)
+
+    for m in _CAP_RUN_RE.finditer(question):
+        words = m.group(0).split()
+        while words and words[0].lower() in _QUESTION_STOPWORDS:
+            words = words[1:]
+        while words and words[-1].lower() in _QUESTION_STOPWORDS:
+            words = words[:-1]
+        if not words:
+            continue
+        phrase = " ".join(words)
+        is_acronym = phrase.isupper() and len(phrase) >= 2
+        if len(words) >= 2 or is_acronym:      # keep phrases & acronyms, not lone words
+            terms.append(phrase)
+
+    return terms
+
+
+def _dedupe_preserve(terms: list[str], cap: int) -> list[str]:
+    """Case-insensitively dedupe, drop stopword-only/short terms, keep order, cap."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in terms:
+        t = t.strip()
+        key = _normalize(t)
+        if len(key) < 3 or key in _QUESTION_STOPWORDS or key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def extract_query_terms(
+    question: str,
+    use_llm: bool = True,
+    max_terms: int = 6,
+    llm_model: str = "gemma3-27b-it",
+    base_url: str = "http://localhost:11434/v1",
+    api_key: str = "ollama",
+) -> list[str]:
+    """
+    Extract key terms from a question to seed focused retrieval.
+
+    Combines the deterministic heuristic (capitalised/acronym/quoted phrases,
+    listed FIRST so nested terms like "Adjusted EBITDA" are prioritised) with the
+    LLM extractor reused from collate (semantic terms the heuristic misses). The
+    LLM step degrades gracefully — if it errors, the heuristic terms still stand.
+    """
+    terms = _heuristic_key_terms(question)
+
+    if use_llm:
+        try:
+            from .collate import extract_key_terms
+            terms = terms + extract_key_terms(
+                question, llm_model=llm_model, base_url=base_url, api_key=api_key,
+            )
+        except Exception as exc:   # noqa: BLE001 — LLM/backend unavailable, etc.
+            print(f"      → LLM term extraction unavailable "
+                  f"({type(exc).__name__}); using heuristic terms only")
+
+    # Never seed with the whole question as a "term"; it defeats the purpose.
+    q_norm = _normalize(question)
+    terms = [t for t in terms if _normalize(t) != q_norm]
+    return _dedupe_preserve(terms, max_terms)
+
+
 # ── Search tool (what the agent drives) ───────────────────────────────────────
 
 def _make_search_tool(index: DocumentIndex, pool: dict[int, tuple[Document, float]],
@@ -483,6 +595,7 @@ def _run_agent_loop(
     base_url: str,
     api_key: str,
     whole_doc: list[tuple[Document, str]] | None = None,
+    key_terms: list[str] | None = None,
 ) -> dict:
     """
     Self-correcting tool-calling loop.
@@ -499,9 +612,13 @@ def _run_agent_loop(
     llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
     llm_with_tools = llm.bind_tools([search_tool])
 
+    human = f"Question: {question}"
+    if key_terms:
+        human += ("\n\nKey terms detected in this question — search for these "
+                  "individually as needed: " + ", ".join(key_terms))
     messages: list = [
         SystemMessage(content=_SYSTEM),
-        HumanMessage(content=f"Question: {question}"),
+        HumanMessage(content=human),
     ]
 
     last_data: dict = {}
@@ -551,6 +668,9 @@ def run_query(
     min_references: int = 1,
     max_nudges: int = 3,
     max_answer_refs: int = 3,
+    expand_query: bool = True,
+    use_llm_terms: bool = True,
+    max_seed_terms: int = 6,
     llm_model: str = "gemma3-27b-it",
     base_url: str = "http://localhost:11434/v1",
     api_key: str = "ollama",
@@ -559,6 +679,9 @@ def run_query(
     Answer an open natural-language question about the document.
 
     Strategy (self-correcting agentic retrieve-refine + grounding guard):
+    0. Key terms are extracted from the question and each gets a focused retrieval
+       seeded into the pool, so a nested term ("Adjusted EBITDA") in a long query
+       is not buried by the query's bulk (coverage). The agent is told the terms.
     1. A tool-calling agent drives `search_document`, issuing and REFINING its own
        queries (repeated wording is rejected to force genuine variation).
     2. When it proposes a final answer it is validated IN-LOOP: if it tried too
@@ -582,6 +705,11 @@ def run_query(
         min_references: Grounded references required before an answer is accepted.
         max_nudges:     Max corrective feedback rounds when coverage falls short.
         max_answer_refs: Max answer-stating passages to fold in (step 4). 0 disables.
+        expand_query:   If True, extract key terms from the question and seed a
+                        focused retrieval per term (coverage for long queries).
+        use_llm_terms:  If True, augment the heuristic key terms with the LLM
+                        extractor; if False, use the deterministic heuristic only.
+        max_seed_terms: Max key terms to seed with.
 
     Returns:
         QueryResult. result.answer is the value; result.references lists EVERY
@@ -605,15 +733,29 @@ def run_query(
         for doc in (chunk_to_doc(c) for c in index.chunks)
     ]
 
-    # Seed the pool so we still have candidates to ground against / fall back on
-    # even if the agent never calls the tool.
-    for doc, score in retrieve_content_candidates(index, question, top_k=top_k):
-        usable = materialize_candidate(doc, index)
-        if usable is None:
-            continue
-        cid = usable.metadata.get("chunk_id")
-        if cid is not None and cid not in pool:
-            pool[cid] = (usable, score)
+    # Extract key terms so a nested term ("Adjusted EBITDA") gets its own focused
+    # search — otherwise a long query's embedding may bury it below the top_k.
+    key_terms: list[str] = []
+    if expand_query:
+        key_terms = extract_query_terms(
+            question, use_llm=use_llm_terms, max_terms=max_seed_terms,
+            llm_model=llm_model, base_url=base_url, api_key=api_key,
+        )
+        if key_terms:
+            print(f"      → Key terms for seeding: {key_terms}")
+
+    # Seed the pool with the full question AND each key term, so we have strong
+    # candidates to ground against / fall back on even if the agent never calls the
+    # tool. A focused term retrieval scores its chunk higher than the long-query
+    # retrieval does; keep the MAX score per chunk so that higher score wins.
+    for seed_query in [question, *key_terms]:
+        for doc, score in retrieve_content_candidates(index, seed_query, top_k=top_k):
+            usable = materialize_candidate(doc, index)
+            if usable is None:
+                continue
+            cid = usable.metadata.get("chunk_id")
+            if cid is not None and (cid not in pool or score > pool[cid][1]):
+                pool[cid] = (usable, score)
 
     data: dict = {}
     try:
@@ -622,7 +764,7 @@ def run_query(
             max_iterations=max_iterations, min_searches=min_searches,
             min_references=min_references, max_nudges=max_nudges,
             llm_model=llm_model, base_url=base_url, api_key=api_key,
-            whole_doc=whole_doc,
+            whole_doc=whole_doc, key_terms=key_terms,
         )
         print(f"      → Agent searched {len(search_terms)} time(s): {search_terms}")
         if not data:   # backend ignored tools / produced no JSON → single-shot
@@ -648,8 +790,8 @@ def run_query(
         key=lambda m: -(m.score or 0.0),
     )
 
-    base = dict(question=question, search_terms=search_terms, supports=supports,
-                reasoning=reasoning, confidence=confidence)
+    base = dict(question=question, key_terms=key_terms, search_terms=search_terms,
+                supports=supports, reasoning=reasoning, confidence=confidence)
 
     # ── Grounding guard: every quote must be verbatim in a document passage ──
     if not answer:
@@ -741,6 +883,7 @@ if __name__ == "__main__":
     res = run_query(idx, sys.argv[2])
     print("\n" + "=" * 60)
     print("ANSWER    :", res.answer if res.found else "(not found)")
+    print("KEY TERMS :", res.key_terms)
     print("CONFIDENCE:", res.confidence)
     print(f"REFERENCES: {len(res.references)} grounded")
     for i, ref in enumerate(res.references, 1):
@@ -748,4 +891,8 @@ if __name__ == "__main__":
         score = "n/a" if ref.score is None else f"{ref.score:.3f}"
         print(f"  [{i}] ({ref.confidence}, score={score}){star} {ref.heading} {ref.pages}")
         print(f"      {ref.reference[:200]}")
+    print(f"SUPPORTS  : {len(res.supports)} retrieved passage(s)")
+    for i, sup in enumerate(res.supports, 1):
+        score = "n/a" if sup.score is None else f"{sup.score:.3f}"
+        print(f"  [{i}] (score={score}) {sup.heading} {sup.pages}")
     print("TRIED     :", res.search_terms)

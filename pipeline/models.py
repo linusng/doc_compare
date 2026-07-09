@@ -139,6 +139,8 @@ class QueryResult(BaseModel):
         references   : ALL grounded references, ranked best (confidence, then score) first.
         confidence   : overall self-rated certainty ("high"/"medium"/"low").
         reasoning    : short LLM rationale, kept for audit only.
+        key_terms    : key terms extracted from the question to seed retrieval
+                       (so a nested term like "Adjusted EBITDA" gets its own search).
         search_terms : the query strings the agent actually tried (refinement trail).
         supports     : every retrieved passage the answer draws on (list[ContentMatch]).
     The single-value mirror fields (reference, heading, pages, chunk_id, score)
@@ -148,6 +150,7 @@ class QueryResult(BaseModel):
     found: bool = False
     answer: str | None = None
     references: list[QueryReference] = []
+    key_terms: list[str] = []
     # Best reference mirrored as flat fields — convenience for single-result use.
     reference: str | None = None
     heading: str | None = None
