@@ -38,7 +38,6 @@ import unicodedata
 
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 
@@ -859,14 +858,16 @@ def _single_shot_fallback(
         for d, _ in passages
     )
     llm = ChatOpenAI(model=llm_model, base_url=base_url, api_key=api_key, temperature=0)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", _SYSTEM.replace(
-            "You cannot see the document directly — you must use the "
-            "`search_document` tool to retrieve passages.",
-            "You are given the most relevant passages below.")),
-        ("human", "Question: {question}\n\nPassages:\n{context}"),
-    ])
-    out = (prompt | llm).invoke({"question": question, "context": context}).content
+    # Plain messages, NOT ChatPromptTemplate: _SYSTEM contains literal JSON braces
+    # ('{"quote": ...}') which a template would misread as input variables.
+    system_text = _SYSTEM.replace(
+        "You cannot see the document directly — you must use the "
+        "`search_document` tool to retrieve passages.",
+        "You are given the most relevant passages below.")
+    out = llm.invoke([
+        SystemMessage(content=system_text),
+        HumanMessage(content=f"Question: {question}\n\nPassages:\n{context}"),
+    ]).content
     return _parse_final(str(out))
 
 

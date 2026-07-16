@@ -10,6 +10,7 @@ import re
 from collections import defaultdict
 
 from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
@@ -188,30 +189,32 @@ def expand_terms(
 
     terms_list = "\n".join(f"- {t}" for t in terms)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", (
-            "You are a financial and legal terminology expert.\n\n"
-            "For each term below, generate alternative search variants that "
-            "might appear in a formal legal or financial document:\n"
-            "- Acronyms → full English form (e.g. SONIA → Sterling Overnight Index Average)\n"
-            "- Currency codes → written forms (e.g. GBP → sterling, pound sterling)\n"
-            "- Abbreviations → full form (e.g. p.a. → per annum)\n"
-            "- Common synonyms used in facility agreements\n\n"
-            "Rules:\n"
-            "- Only add variants that would realistically appear in a UK/international "
-            "facility agreement.\n"
-            "- If a term needs no expansion (e.g. 'Final Maturity Date'), return only "
-            "the original.\n"
-            "- Do NOT invent variants — only include ones you are confident about.\n\n"
-            "Return ONLY valid JSON in this exact shape:\n"
-            '{"SONIA": ["SONIA", "Sterling Overnight Index Average"], '
-            '"GBP": ["GBP", "sterling", "pound sterling"], '
-            '"Final Maturity Date": ["Final Maturity Date"]}'
-        )),
-        ("human", f"Terms to expand:\n{terms_list}"),
-    ])
-
-    raw = (prompt | llm).invoke({}).content.strip()
+    # Plain messages, NOT ChatPromptTemplate: the JSON example below contains
+    # literal curly braces, which a template would misread as input variables
+    # (KeyError: missing variables {'"SONIA"'} ...).
+    system_text = (
+        "You are a financial and legal terminology expert.\n\n"
+        "For each term below, generate alternative search variants that "
+        "might appear in a formal legal or financial document:\n"
+        "- Acronyms → full English form (e.g. SONIA → Sterling Overnight Index Average)\n"
+        "- Currency codes → written forms (e.g. GBP → sterling, pound sterling)\n"
+        "- Abbreviations → full form (e.g. p.a. → per annum)\n"
+        "- Common synonyms used in facility agreements\n\n"
+        "Rules:\n"
+        "- Only add variants that would realistically appear in a UK/international "
+        "facility agreement.\n"
+        "- If a term needs no expansion (e.g. 'Final Maturity Date'), return only "
+        "the original.\n"
+        "- Do NOT invent variants — only include ones you are confident about.\n\n"
+        "Return ONLY valid JSON in this exact shape:\n"
+        '{"SONIA": ["SONIA", "Sterling Overnight Index Average"], '
+        '"GBP": ["GBP", "sterling", "pound sterling"], '
+        '"Final Maturity Date": ["Final Maturity Date"]}'
+    )
+    raw = llm.invoke([
+        SystemMessage(content=system_text),
+        HumanMessage(content=f"Terms to expand:\n{terms_list}"),
+    ]).content.strip()
 
     # Parse JSON object from response
     m = re.search(r'\{.*\}', raw, re.DOTALL)
