@@ -787,7 +787,7 @@ class RetrievalResult(BaseModel):
 
 # ── LLM plumbing (optional, budgeted, always degradable) ──────────────────────
 
-class _LLM:
+class LLM:
     """
     Thin, fault-tolerant wrapper around the chat endpoint.
 
@@ -853,7 +853,7 @@ class _LLM:
             return ""
 
 
-def _parse_json_array(raw: str) -> list:
+def parse_json_array(raw: str) -> list:
     """Tolerantly pull a JSON array out of a model response."""
     if not raw:
         return []
@@ -971,7 +971,7 @@ _DECOMPOSE_SYSTEM = (
 )
 
 
-def llm_aspects(text: str, llm: _LLM, max_aspects: int = MAX_ASPECTS
+def llm_aspects(text: str, llm: LLM, max_aspects: int = MAX_ASPECTS
                 ) -> list[tuple[str, list[str]]]:
     """
     LLM decomposition of the input into (item, key_terms) pairs.
@@ -995,7 +995,7 @@ def llm_aspects(text: str, llm: _LLM, max_aspects: int = MAX_ASPECTS
 
     out: list[tuple[str, list[str]]] = []
     for block in blocks:
-        data = _parse_json_array(llm.chat(_DECOMPOSE_SYSTEM, block))
+        data = parse_json_array(llm.chat(_DECOMPOSE_SYSTEM, block))
         for entry in data:
             if isinstance(entry, dict):
                 item = str(entry.get("item", "") or "").strip()
@@ -1012,7 +1012,7 @@ def llm_aspects(text: str, llm: _LLM, max_aspects: int = MAX_ASPECTS
 
 def build_aspects(
     text: str,
-    llm: _LLM,
+    llm: LLM,
     lexical: LexicalIndex,
     max_aspects: int = MAX_ASPECTS,
     verbose: bool = True,
@@ -1091,7 +1091,7 @@ _HYDE_SYSTEM = (
 )
 
 
-def plan_queries(aspect: Aspect, llm: _LLM, use_hyde: bool = True) -> list[str]:
+def plan_queries(aspect: Aspect, llm: LLM, use_hyde: bool = True) -> list[str]:
     """
     Build the query set for one aspect.
 
@@ -1144,7 +1144,7 @@ _REFINE_SYSTEM = (
 )
 
 
-def refine_queries(aspect: Aspect, seen_headings: list[str], llm: _LLM,
+def refine_queries(aspect: Aspect, seen_headings: list[str], llm: LLM,
                    max_new: int = 3) -> list[str]:
     """
     The agentic step: ask the model for genuinely different angles on an item
@@ -1161,7 +1161,7 @@ def refine_queries(aspect: Aspect, seen_headings: list[str], llm: _LLM,
             + "\n\nHEADINGS RETURNED (none contained the item):\n"
             + ("\n".join(f"- {h[:100]}" for h in seen_headings[:8]) or "- (nothing)")
         )
-        proposals = _parse_json_array(llm.chat(_REFINE_SYSTEM, human))
+        proposals = parse_json_array(llm.chat(_REFINE_SYSTEM, human))
         out = []
         for p in proposals:
             q = " ".join(str(p).split())
@@ -1386,14 +1386,41 @@ _RERANK_SYSTEM = (
 )
 
 
+def _value_kind(value: str) -> str | None:
+    """Classify a figure so like can be compared with like."""
+    v = _normalize(value)
+    if re.search(r"\d\s*:\s*\d", v):
+        return "ratio"
+    if re.search(r"(?:%|per\s?cent|percent)", v):
+        return "percentage"
+    if re.search(r"[a-z]{3}\s?[\d,]|[£$€¥]", v):
+        return "amount"
+    return None
+
+
+_KIND_PRESENT_RE = {
+    "ratio": re.compile(r"\d\s*:\s*\d"),
+    "percentage": re.compile(r"\d\s*(?:%|per\s?cent|percent)"),
+    "amount": re.compile(r"(?:[a-z]{3}\s?[\d,]+|[£$€¥]\s?[\d,]+)"),
+}
+
+
 def _lexical_grade(aspect: Aspect, chunk: _ChunkView) -> int:
     """
     Deterministic grader used when no LLM is available.
 
-    Combines three cheap signals that correlate well with usefulness:
+    Combines four cheap signals that correlate well with usefulness:
       • how much of the item's distinctive vocabulary the chunk contains,
       • whether the chunk carries the item's exact values ("3.5:1", "10%"),
-      • whether the chunk DEFINES or is titled with one of the key terms.
+      • whether the chunk DEFINES or is titled with one of the key terms,
+      • whether the chunk states a figure of the SAME KIND as the item's.
+
+    That last signal matters more than it looks: when the document disagrees with
+    the query — the case this pipeline exists to find — the figures differ, so
+    exact-value matching fails and raw overlap drops just below threshold. A CP
+    item quoting "USD 250,000,000" and a clause stating "USD 200,000,000" are
+    about the same term; grading that passage away would report the clause as
+    missing instead of as a deviation.
     """
     a_tokens = set(_tokenize(aspect.text))
     if not a_tokens:
@@ -1404,12 +1431,14 @@ def _lexical_grade(aspect: Aspect, chunk: _ChunkView) -> int:
     term_hit = any(_normalize(t) in chunk.norm_text for t in aspect.key_terms if len(t) > 2)
     ref_hit = any(section_number(r) and section_number(r) == section_number(chunk.heading)
                   for r in aspect.section_refs)
+    kinds = {k for k in (_value_kind(v) for v in aspect.values) if k}
+    kind_hit = any(_KIND_PRESENT_RE[k].search(chunk.norm_text) for k in kinds)
 
     if ref_hit or (value_hit and overlap >= 0.25) or overlap >= 0.6:
         return 3
-    if (term_hit and overlap >= 0.2) or overlap >= 0.4:
+    if (term_hit and overlap >= 0.2) or overlap >= 0.4 or (kind_hit and overlap >= 0.3):
         return 2
-    if overlap >= 0.15 or term_hit:
+    if overlap >= 0.15 or term_hit or kind_hit:
         return 1
     return 0
 
@@ -1418,7 +1447,7 @@ def rerank_candidates(
     aspect: Aspect,
     candidate_ids: list[int],
     by_id: dict[int, _ChunkView],
-    llm: _LLM,
+    llm: LLM,
     snippet_chars: int = 900,
 ) -> dict[int, tuple[int, str | None]]:
     """
@@ -1441,7 +1470,7 @@ def rerank_candidates(
             body = ch.content.strip()[:snippet_chars] or ch.heading
             lines.append(f"### CANDIDATE {cid}\nHEADING: {ch.heading}\nTEXT: {body}")
         human = f"ITEM:\n{aspect.text[:900]}\n\n" + "\n\n".join(lines)
-        for entry in _parse_json_array(llm.chat(_RERANK_SYSTEM, human)):
+        for entry in parse_json_array(llm.chat(_RERANK_SYSTEM, human)):
             if not isinstance(entry, dict):
                 continue
             try:
@@ -1701,7 +1730,7 @@ class Retriever:
             `.aspects`, `.coverage`, `.uncovered_aspects` and `.coverage_report()`.
         """
         verbose = self.verbose if verbose is None else verbose
-        llm = _LLM(**self._llm_config)
+        llm = LLM(**self._llm_config)
         llm.verbose = verbose
         text = text or ""
 
