@@ -33,6 +33,15 @@ is the part that makes the row trustworthy:
         …does not exceed 3.5:1. (21.2 Financial covenants, Page 30)
   • Items retrieval could not cover are reported as not addressed in the FA —
     silence in the agreement is a finding, not a match.
+  • Items are fragments of the field, NOT independent statements. The agent is
+    given the whole field first, the shared evidence pool for all items, and an
+    explicit flag on any item that refers back ("the Company shall provide the
+    above within 30 days", "such documents", "the foregoing"), which it must
+    resolve against the earlier items before judging. A back-referencing item
+    that retrieval could not cover is NEVER auto-marked "not addressed" — "the
+    above" matches nothing in any agreement, so empty retrieval there says
+    nothing about the FA. The agent also returns an `overall` verdict on the
+    field read end to end, which can raise a deviation on its own.
 
 The chat model is INJECTED (`llm`), not constructed here, so the caller owns the
 endpoint, model and temperature — and the same client can be reused across
@@ -97,6 +106,40 @@ def _flatten(text: str) -> str:
 
 _SENTENCE_END_RE = re.compile(r"(?<=[.;:])\s+")
 
+# Wording that only means something in the context of what came BEFORE it:
+# "the Company shall provide the above within 30 days", "such documents",
+# "the foregoing". An item like that is not self-contained — retrieved alone it
+# matches nothing useful, and judged alone it looks unaddressed.
+_BACKREF_RE = re.compile(
+    r"\b("
+    r"the above|above[-\s]mentioned|abovementioned|aforementioned|aforesaid"
+    r"|the foregoing|as (?:stated|set out|described|mentioned|listed) above"
+    r"|the preceding|the said|said (?:documents?|items?|conditions?)"
+    r"|such (?:documents?|items?|information|conditions?|requirements?|"
+    r"deliverables?|matters?|amounts?|obligations?)"
+    r"|there(?:of|in|to|under|with)"
+    r"|the same"
+    r")\b",
+    re.IGNORECASE,
+)
+# An item that OPENS with a bare pronoun is continuing the previous sentence.
+_LEADING_PRONOUN_RE = re.compile(
+    r"^\s*(?:it|they|these|those|this|that|he|she|such)\b\s+(?:shall|must|will|is|are|was|were)",
+    re.IGNORECASE,
+)
+
+
+def has_back_reference(text: str) -> bool:
+    """
+    True if the item leans on wording that came before it in the CP field.
+
+    Used to keep such an item from being judged in isolation — both in what the
+    agent is told about it, and in whether "retrieval found nothing" is allowed
+    to become "the FA does not address this".
+    """
+    t = text or ""
+    return bool(_BACKREF_RE.search(t) or _LEADING_PRONOUN_RE.match(t))
+
 
 def _sentences(text: str) -> list[str]:
     """Split a passage into sentence-ish units, flattened to single lines."""
@@ -129,6 +172,7 @@ class Finding(BaseModel):
     quotes: list[Quote] = Field(default_factory=list)    # verbatim FA wording
     chunk_ids: list[int] = Field(default_factory=list)
     assessed: bool = True                                # False → manual review
+    refers_back: bool = False                            # leans on earlier items
 
     def comment(self) -> str:
         """`<item>: <explanation> Therefore, it is (not) a deviation.`"""
@@ -156,6 +200,7 @@ class ComparisonRow(BaseModel):
     used_chunk_ids: list[int] = Field(default_factory=list)
     coverage: float = 0.0
     needs_review: bool = False
+    overall_note: str = ""          # the agent's field-level observation
 
     @property
     def deviation_label(self) -> str:
@@ -332,21 +377,43 @@ def select_evidence(
     res: RetrievalResult,
     min_grade: int = MIN_EVIDENCE_GRADE,
     max_sections: int = MAX_SECTIONS,
+    include_weak: bool = True,
 ) -> list[RetrievedItem]:
     """
-    Narrow retrieval's output to what is worth showing the agent.
+    Choose what the agent gets to see, best first:
 
-    Retrieval optimises recall — weak matches, definition supports, sibling
-    parts. Here we want precision: confidently graded passages first, then
-    supports (definitions the clauses lean on) with any leftover room.
+      1. confidently graded passages (>= min_grade),
+      2. weakly graded ones, if there is room,
+      3. definition/cross-reference supports with whatever is left.
+
+    Step 2 matters more than it looks. A grade is assigned PER ITEM, and an item
+    that refers back ("the Company shall provide the above within 30 days")
+    retrieves badly by construction — the clause that actually decides it (the
+    delivery deadline) is scored against a fragment that names no subject, so it
+    lands at grade 1 and a strict filter drops it. The agent then cannot cite the
+    one clause it needed. Filling spare slots with weak passages costs nothing:
+    they are labelled with their grade in the prompt, and the FA Legal Section
+    column only ever shows passages the agent actually cited.
+
+    Set include_weak=False for a strict, high-precision pool.
     """
-    primary = sorted((it for it in res.items
-                      if not it.is_support and it.grade >= min_grade),
-                     key=lambda it: (-it.grade, -it.score))
-    chosen = primary[:max_sections]
-    room = max_sections - len(chosen)
-    if room > 0:
-        chosen += [it for it in res.items if it.is_support][:room]
+    strong, weak, supports = [], [], []
+    for it in res.items:
+        if it.is_support:
+            supports.append(it)
+        elif it.grade >= min_grade:
+            strong.append(it)
+        elif it.grade >= 1:
+            weak.append(it)
+
+    strong.sort(key=lambda it: (-it.grade, -it.score))
+    weak.sort(key=lambda it: (-it.grade, -it.score))
+
+    chosen = strong[:max_sections]
+    if include_weak and len(chosen) < max_sections:
+        chosen += weak[: max_sections - len(chosen)]
+    if len(chosen) < max_sections:
+        chosen += supports[: max_sections - len(chosen)]
     return chosen
 
 
@@ -384,8 +451,18 @@ def _evidence_block(items: list[RetrievedItem]) -> str:
 _SYSTEM = (
     "You are a legal analyst comparing a CP (conditions precedent / term sheet) "
     "field against the signed facility agreement (FA).\n\n"
-    "You are given the CP FIELD, the ITEMS it breaks down into, and FA SECTIONS "
-    "retrieved for it (each with an id).\n\n"
+    "You are given the full CP FIELD, the ITEMS it breaks down into, and FA "
+    "SECTIONS retrieved for the field as a whole (each with an id).\n\n"
+    "READ THE WHOLE FIELD FIRST. The items are fragments of it, split for "
+    "convenience — they are NOT independent. An item may only make sense in the "
+    "context of the ones before it: 'the Company shall provide the above within "
+    "30 days', 'such documents', 'the foregoing', 'these shall be certified'. "
+    "Where an item refers back, RESOLVE it against the earlier items and the full "
+    "field text before judging it, and say in your explanation what it resolves "
+    "to. Items flagged (refers back) must never be judged in isolation.\n\n"
+    "The SECTIONS were retrieved for the WHOLE field, so any item may be decided "
+    "by any section — use whichever sections are relevant, not only the ones "
+    "retrieved for that item.\n\n"
     "Return ONE finding per item. For each item decide whether the FA DEVIATES "
     "from it. A deviation exists when the FA states something different (a "
     "different figure, period, mechanism or condition), is more or less "
@@ -400,14 +477,22 @@ _SYSTEM = (
     "quote a whole clause, and do not quote text you were not shown.\n"
     "- sections: the ids you actually relied on.\n"
     "- explanation: state what the FA actually says and why it does or does not "
-    "match the item. Max 35 words. Do NOT write a concluding 'therefore' "
-    "sentence — that is added for you.\n\n"
+    "match the item. For an item that refers back, start by naming what it refers "
+    "to. Max 40 words. Do NOT write a concluding 'therefore' sentence — that is "
+    "added for you.\n\n"
+    "Finally, judge the FIELD AS A WHOLE in \"overall\": anything that only "
+    "appears when the field is read end to end — a requirement the items satisfy "
+    "individually but the FA does not deliver together, or a back-reference the "
+    "FA never picks up. Set its deviation to false when the per-item findings "
+    "already say everything.\n\n"
     "Return ONLY a JSON object:\n"
     '  {"findings": [\n'
     '     {"item": <id>, "deviation": true|false, "sections": [<id>, ...],\n'
     '      "quotes": ["<verbatim FA wording>", ...],\n'
     '      "explanation": "<what the FA says and how it compares>"}\n'
-    "  ]}"
+    "   ],\n"
+    '   "overall": {"deviation": true|false, "note": "<field-level observation, '
+    'max 30 words, or empty>"}}'
 )
 
 
@@ -484,7 +569,20 @@ def _build_findings(
         if entry is None:
             # Retrieval found nothing → the FA is silent, which is a finding we
             # can make without the model. Otherwise it is simply unassessed.
-            if not aspect.covered:
+            #
+            # EXCEPT for an item that refers back to earlier ones: retrieval
+            # searched for "the Company shall provide the above", which matches
+            # nothing in any agreement. Empty retrieval there says nothing about
+            # the FA, so calling it "not addressed" would invent a deviation.
+            if not aspect.covered and has_back_reference(aspect.text):
+                findings.append(Finding(
+                    item_id=aspect.id, item_text=aspect.text, deviation=False,
+                    explanation=("This item refers back to earlier items and could "
+                                 "not be resolved on its own — read it with the "
+                                 "items above; manual review required."),
+                    assessed=False, refers_back=True,
+                ))
+            elif not aspect.covered:
                 findings.append(Finding(
                     item_id=aspect.id, item_text=aspect.text,
                     deviation=bool(treat_missing_as_deviation),
@@ -554,12 +652,14 @@ def _build_findings(
             deviation=bool(entry.get("deviation", False)),
             explanation=str(entry.get("explanation", "") or "").strip(),
             quotes=quotes, chunk_ids=ids, assessed=True,
+            refers_back=has_back_reference(aspect.text),
         ))
 
     return findings
 
 
-def _compose_comments(findings: list[Finding], needs_review: bool) -> str:
+def _compose_comments(findings: list[Finding], needs_review: bool,
+                      overall_note: str = "") -> str:
     """
     One line per item, IN ITEM ORDER, each ending in the mandated sentence.
 
@@ -587,6 +687,8 @@ def _compose_comments(findings: list[Finding], needs_review: bool) -> str:
 
     lines.extend(f.comment() for f in sorted(findings, key=lambda f: f.item_id))
 
+    if overall_note:
+        lines.append(f"Overall: {overall_note.rstrip('.')}.")
     if needs_review:
         lines.append("⚠ Manual review required — see the items marked not assessed.")
     return "\n".join(lines)
@@ -627,25 +729,42 @@ def compare_one(
     evidence = select_evidence(res, min_evidence_grade, max_sections)
     by_id = {it.chunk_id: it for it in evidence}
 
-    items_block = ("\n".join(f"  [{a.id}] {a.text}" for a in res.aspects)
-                   or f"  [0] {query}")
-    missing = [a.text for a in res.uncovered_aspects]
+    # Items that lean on earlier ones are flagged for the agent, so it resolves
+    # them against the field instead of judging a fragment.
+    backref_ids = {a.id for a in res.aspects if has_back_reference(a.text)}
+    items_block = ("\n".join(
+        f"  [{a.id}] {a.text}"
+        + ("  (refers back — resolve against the items above and the CP FIELD)"
+           if a.id in backref_ids else "")
+        for a in res.aspects) or f"  [0] {query}")
+
+    # A back-referencing item retrieves nothing because "the above" matches
+    # nothing — that is a property of the query, not of the FA. Listing it as
+    # "found nothing" would push the agent to call it unaddressed.
+    missing = [a.text for a in res.uncovered_aspects if a.id not in backref_ids]
 
     human = (
-        f"CP FIELD:\n{query}\n\n"
+        f"CP FIELD (read this in full first — the items below are fragments of "
+        f"it):\n{query}\n\n"
         f"ITEMS (return one finding for EACH):\n{items_block}\n\n"
         + (f"ITEMS FOR WHICH RETRIEVAL FOUND NOTHING (treat as not addressed "
            f"unless a section below covers them):\n"
            + "\n".join(f"  - {m}" for m in missing) + "\n\n" if missing else "")
-        + f"FA SECTIONS:\n{_evidence_block(evidence)}"
+        + f"FA SECTIONS (retrieved for the whole field — any item may be decided "
+          f"by any of them):\n{_evidence_block(evidence)}"
     )
     data = _parse_json_object(_chat(llm, _SYSTEM, human, verbose))
 
     findings = _build_findings(data, res, by_id, query, treat_missing_as_deviation)
     needs_review = any(not f.assessed for f in findings) or not findings
 
+    # ── The field read as a whole, on top of the per-item findings ──────────
+    overall = data.get("overall") if isinstance(data.get("overall"), dict) else {}
+    overall_deviation = bool(overall.get("deviation", False))
+    overall_note = str(overall.get("note", "") or "").strip()
+
     # ── The row's verdict: Yes if ANY item deviates, No only if none do ──────
-    deviation = any(f.deviation for f in findings if f.assessed)
+    deviation = any(f.deviation for f in findings if f.assessed) or overall_deviation
 
     # ── FA Legal Section: the quoted sentences, in item order, deduped ───────
     sections: list[str] = []
@@ -668,12 +787,12 @@ def compare_one(
         comments = ("[No items could be derived from this field — manual review "
                     "required]")
     else:
-        comments = _compose_comments(findings, needs_review)
+        comments = _compose_comments(findings, needs_review, overall_note)
 
     row = ComparisonRow(
         cp_field=query, deviation=deviation, comments=comments, sections=sections,
         findings=findings, used_chunk_ids=used_ids, coverage=res.coverage,
-        needs_review=needs_review,
+        needs_review=needs_review, overall_note=overall_note,
     )
     if verbose:
         n_dev = sum(1 for f in findings if f.assessed and f.deviation)
