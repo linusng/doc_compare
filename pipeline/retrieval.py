@@ -86,12 +86,14 @@ and DocumentIndexV3 all satisfy that.
 
 Usage
 -----
+    from langchain_openai import ChatOpenAI
     from pipeline.ingestion_v3 import DocumentIndexV3
     from pipeline.retrieval import retrieve, Retriever
 
+    llm = ChatOpenAI(base_url=..., model=..., api_key=..., streaming=True)
     index = DocumentIndexV3.from_pdf("agreement.pdf")
 
-    result = retrieve(index, long_free_text)
+    result = retrieve(index, long_free_text, llm)
 
     for item in result:                       # the result IS a list of items
         print(item.heading, item.pages, item.grade, item.covers)
@@ -100,9 +102,14 @@ Usage
     context = result.combined_context         # ready for the next LLM step
 
     # Reuse across many queries (BM25 index built once):
-    r = Retriever(index)
+    r = Retriever(index, llm)
     items_a = r.retrieve(text_a).items
     items_b = r.retrieve(text_b).items
+
+The chat client is INJECTED — this module never constructs one, so the endpoint,
+model, temperature and streaming settings stay the caller's. Pass None (or omit
+it) and every LLM stage takes its heuristic fallback; retrieval still runs end to
+end on BM25F, lexical lookups and the deterministic grader.
 """
 
 import json
@@ -114,19 +121,14 @@ from dataclasses import dataclass, field
 
 from pydantic import BaseModel, Field
 
-try:                                    # optional — the module runs without them
+try:                     # optional — only needed to build message objects
     from langchain_core.messages import HumanMessage, SystemMessage
-    from langchain_openai import ChatOpenAI
     _LANGCHAIN_AVAILABLE = True
-except ImportError:                     # pragma: no cover - depends on install
+except ImportError:      # pragma: no cover - depends on install
     _LANGCHAIN_AVAILABLE = False
 
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
-
-DEFAULT_LLM_MODEL = "gemma3-27b-it"
-DEFAULT_BASE_URL = "http://localhost:11434/v1"
-DEFAULT_API_KEY = "ollama"
 
 MAX_ASPECTS = 24            # hard cap on items decomposed out of the input
 TOP_K_PER_QUERY = 8         # candidates pulled per query, per channel
@@ -789,44 +791,36 @@ class RetrievalResult(BaseModel):
 
 class LLM:
     """
-    Thin, fault-tolerant wrapper around the chat endpoint.
+    Thin, fault-tolerant wrapper around an INJECTED chat client.
 
-    Every LLM stage in this module is an ENHANCEMENT, never a dependency: the
-    first failure flips `available` off and all later stages silently take their
-    heuristic path. A call budget stops a pathological input from fanning out
-    into hundreds of requests.
+    The client is supplied by the caller (a ChatOpenAI, or anything with
+    `.invoke(messages) -> .content`), so the endpoint, model, temperature and
+    streaming settings are theirs to own — this module never constructs one.
+    Pass None to run fully heuristic.
+
+    What the wrapper adds on top of the raw client:
+      • every LLM stage stays an ENHANCEMENT, never a dependency — the first
+        failure flips `available` off and all later stages take their heuristic
+        path instead of propagating the error;
+      • a call budget, so a pathological input cannot fan out into hundreds of
+        requests;
+      • a call count, for the stats a retrieval run reports.
+
+    A streaming client works unchanged: `.invoke()` still returns the completed
+    message, so `.content` is the full text.
     """
 
     def __init__(
         self,
-        model: str = DEFAULT_LLM_MODEL,
-        base_url: str = DEFAULT_BASE_URL,
-        api_key: str = DEFAULT_API_KEY,
-        enabled: bool = True,
+        client=None,
         max_calls: int = MAX_LLM_CALLS,
         verbose: bool = True,
     ):
-        self.model = model
-        self.base_url = base_url
-        self.api_key = api_key
+        self.client = client
         self.verbose = verbose
         self.max_calls = max_calls
         self.calls = 0
-        self.available = bool(enabled and _LANGCHAIN_AVAILABLE)
-        self._client = None
-        if enabled and not _LANGCHAIN_AVAILABLE and verbose:
-            print("      → langchain_openai unavailable; running fully heuristic")
-
-    def _client_or_none(self):
-        if self._client is None and self.available:
-            try:
-                self._client = ChatOpenAI(
-                    model=self.model, base_url=self.base_url,
-                    api_key=self.api_key, temperature=0,
-                )
-            except Exception as exc:                       # noqa: BLE001
-                self._disable(exc)
-        return self._client
+        self.available = client is not None
 
     def _disable(self, exc: Exception) -> None:
         if self.available and self.verbose:
@@ -838,15 +832,12 @@ class LLM:
         """Return the model's text, or "" if unavailable / over budget."""
         if not self.available or self.calls >= self.max_calls:
             return ""
-        client = self._client_or_none()
-        if client is None:
-            return ""
         try:
             self.calls += 1
-            out = client.invoke([
-                SystemMessage(content=system),
-                HumanMessage(content=human),
-            ]).content
+            messages = ([SystemMessage(content=system), HumanMessage(content=human)]
+                        if _LANGCHAIN_AVAILABLE
+                        else [("system", system), ("human", human)])
+            out = self.client.invoke(messages).content
             return out if isinstance(out, str) else str(out or "")
         except Exception as exc:                            # noqa: BLE001
             self._disable(exc)
@@ -1650,17 +1641,20 @@ class Retriever:
     constructing this once and calling `.retrieve()` many times avoids paying it
     per query. `retrieve()` (module-level) is the one-shot convenience wrapper.
 
-        r = Retriever(index)
+        llm = ChatOpenAI(base_url=..., model=..., api_key=..., streaming=True)
+        r = Retriever(index, llm)
         result = r.retrieve(long_text)
+
+    `llm` is the caller's chat client — a ChatOpenAI, or anything exposing
+    `.invoke(messages) -> .content`. Omit it (or pass None) to run every stage
+    heuristically: decomposition, query planning and grading all have
+    deterministic fallbacks, so retrieval still works end to end.
     """
 
     def __init__(
         self,
         index,
-        llm_model: str = DEFAULT_LLM_MODEL,
-        base_url: str = DEFAULT_BASE_URL,
-        api_key: str = DEFAULT_API_KEY,
-        use_llm: bool = True,
+        llm=None,
         max_llm_calls: int = MAX_LLM_CALLS,
         bm25_k1: float = 1.5,
         bm25_b: float = 0.75,
@@ -1668,6 +1662,7 @@ class Retriever:
         verbose: bool = True,
     ):
         self.index = index
+        self.llm = llm
         self.verbose = verbose
         self.chunks = _adapt_chunks(index)
         self.by_id = {c.chunk_id: c for c in self.chunks}
@@ -1676,9 +1671,7 @@ class Retriever:
         self.lexical = LexicalIndex(self.chunks)
         self.vectors = _chunk_vectors(index)
         self.has_dense = _get(index, "vector_store", None) is not None
-        self._llm_config = dict(model=llm_model, base_url=base_url, api_key=api_key,
-                                enabled=use_llm, max_calls=max_llm_calls,
-                                verbose=verbose)
+        self.max_llm_calls = max_llm_calls
         if verbose:
             print(f"[retrieval] Indexed {len(self.chunks)} chunk(s) · "
                   f"sparse=BM25F · dense={'on' if self.has_dense else 'off'} · "
@@ -1701,6 +1694,7 @@ class Retriever:
         expand_depth: int = EXPAND_DEPTH,
         max_support_items: int = MAX_SUPPORT_ITEMS,
         include_sibling_parts: bool = True,
+        llm=None,
         verbose: bool | None = None,
     ) -> RetrievalResult:
         """
@@ -1709,6 +1703,9 @@ class Retriever:
         Args:
             text:                  the free-text input; may be long and may talk
                                    about several unrelated parts of the document.
+            llm:                   chat client for this call only; defaults to the
+                                   one the Retriever was built with. None on both
+                                   runs every stage heuristically.
             max_items:             cap on aspect-covering passages returned.
             max_aspects:           cap on items decomposed out of the input.
             top_k_per_query:       candidates pulled per query, per channel.
@@ -1730,8 +1727,10 @@ class Retriever:
             `.aspects`, `.coverage`, `.uncovered_aspects` and `.coverage_report()`.
         """
         verbose = self.verbose if verbose is None else verbose
-        llm = LLM(**self._llm_config)
-        llm.verbose = verbose
+        # A fresh wrapper per call, so the budget and the "endpoint died" latch
+        # are scoped to this query rather than the Retriever's lifetime.
+        llm = LLM(client=(llm if llm is not None else self.llm),
+                  max_calls=self.max_llm_calls, verbose=verbose)
         text = text or ""
 
         if verbose:
@@ -1901,37 +1900,37 @@ class Retriever:
 
 # ── Module-level convenience API ──────────────────────────────────────────────
 
-def retrieve(index, text: str, **kwargs) -> RetrievalResult:
+def retrieve(index, text: str, llm=None, **kwargs) -> RetrievalResult:
     """
     Retrieve every passage that covers `text`, one shot.
 
-    Splits kwargs between the Retriever constructor (llm_model, base_url,
-    api_key, use_llm, verbose, …) and the retrieve() call, so callers can pass
+    Splits kwargs between the Retriever constructor (max_llm_calls, bm25_*,
+    heading_weight, verbose) and the retrieve() call, so callers can pass
     anything from either without caring which is which.
 
-        result = retrieve(index, long_text, max_items=30, use_hyde=False)
+        llm = ChatOpenAI(base_url=..., model=..., api_key=..., streaming=True)
+        result = retrieve(index, long_text, llm, max_items=30)
         for item in result:
             print(item.heading, item.pages, item.covers)
 
     Building a Retriever once (see the class) is cheaper across many queries.
     """
-    ctor_keys = {"llm_model", "base_url", "api_key", "use_llm", "max_llm_calls",
-                 "bm25_k1", "bm25_b", "heading_weight"}
+    ctor_keys = {"max_llm_calls", "bm25_k1", "bm25_b", "heading_weight"}
     ctor = {k: v for k, v in kwargs.items() if k in ctor_keys}
     if "verbose" in kwargs:
         ctor["verbose"] = kwargs["verbose"]
     call = {k: v for k, v in kwargs.items() if k not in ctor_keys}
-    return Retriever(index, **ctor).retrieve(text, **call)
+    return Retriever(index, llm, **ctor).retrieve(text, **call)
 
 
-def retrieve_items(index, text: str, **kwargs) -> list[RetrievedItem]:
+def retrieve_items(index, text: str, llm=None, **kwargs) -> list[RetrievedItem]:
     """`retrieve()` returning the plain list of items."""
-    return retrieve(index, text, **kwargs).items
+    return retrieve(index, text, llm, **kwargs).items
 
 
-def retrieve_texts(index, text: str, **kwargs) -> list[str]:
+def retrieve_texts(index, text: str, llm=None, **kwargs) -> list[str]:
     """`retrieve()` returning just the passage texts, best-first."""
-    return [it.full_text for it in retrieve(index, text, **kwargs).items]
+    return [it.full_text for it in retrieve(index, text, llm, **kwargs).items]
 
 
 # ── Demo ──────────────────────────────────────────────────────────────────────
@@ -1943,13 +1942,18 @@ if __name__ == "__main__":
         print("Usage: python -m pipeline.retrieval <pdf_path> <text|@file.txt>")
         raise SystemExit(1)
 
+    from langchain_openai import ChatOpenAI
+
     from .ingestion_v3 import DocumentIndexV3   # demo only — not a module dependency
 
     arg = sys.argv[2]
     query_text = open(arg[1:], encoding="utf-8").read() if arg.startswith("@") else arg
 
+    chat = ChatOpenAI(base_url="http://localhost:11434/v1", model="gemma3-27b-it",
+                      api_key="ollama", temperature=0)
+
     idx = DocumentIndexV3.from_pdf(sys.argv[1])
-    res = Retriever(idx).retrieve(query_text)
+    res = Retriever(idx, chat).retrieve(query_text)
 
     print("\n" + "=" * 70)
     print(res.coverage_report())

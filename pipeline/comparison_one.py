@@ -634,8 +634,7 @@ def main() -> None:
 
     index = DocumentIndexV3.from_pdf(pdf_path, llm_model=LLM_MODEL,
                                      base_url=BASE_URL, api_key=API_KEY)
-    res = Retriever(index, llm_model=LLM_MODEL, base_url=BASE_URL,
-                    api_key=API_KEY).retrieve(query)
+    res = Retriever(index, llm).retrieve(query)
     row = compare_one(query, res, llm, page_offset=index.page_offset)
 
     print("\n" + "=" * 70)
