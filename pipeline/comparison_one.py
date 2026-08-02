@@ -25,8 +25,12 @@ is the part that makes the row trustworthy:
     clean.
   • The agent must QUOTE the wording it relied on, and every quote is checked
     verbatim against the retrieved text before it reaches the sheet. Quotes are
-    snapped to the sentences they came from, so the FA Legal Section column holds
-    the operative sentence — not the whole clause — and stays reviewable.
+    snapped to the document's own sentences and widened by CONTEXT_SENTENCES
+    either side, so the FA Legal Section column shows the operative wording WITH
+    the proviso or carve-out around it — enough for a reviewer to judge, without
+    dumping the whole clause. Each entry ends with its section and page:
+
+        …does not exceed 3.5:1. (21.2 Financial covenants, Page 30)
   • Items retrieval could not cover are reported as not addressed in the FA —
     silence in the agreement is a finding, not a match.
 
@@ -57,8 +61,9 @@ except ImportError:                     # pragma: no cover - depends on install
 MIN_EVIDENCE_GRADE = 2      # retrieval grade a passage needs to reach the agent
 MAX_SECTIONS = 8            # passages shown to the agent
 SNIPPET_CHARS = 1200        # per-passage text budget in the prompt
-MAX_QUOTE_SENTENCES = 3     # a quote is snapped to at most this many sentences
-MAX_QUOTE_CHARS = 450       # hard cap on one quoted passage in the sheet
+MAX_QUOTE_SENTENCES = 3     # sentences the quote itself may span
+CONTEXT_SENTENCES = 2       # sentences kept either side, so the quote reads in context
+MAX_QUOTE_CHARS = 1400      # hard cap on one quoted passage in the sheet
 
 # The mandated closing sentences — every assessed item ends with one of these.
 DEVIATION_SENTENCE = "Therefore, it is a deviation."
@@ -110,7 +115,9 @@ class Quote(BaseModel):
     """A verbatim passage from the FA, tied to the section it came from."""
     text: str
     chunk_id: int
+    heading: str = ""
     pages: list = Field(default_factory=list)
+    position: float = 0.0      # where in the chunk it sits (0.0 start, 1.0 end)
 
 
 class Finding(BaseModel):
@@ -177,39 +184,93 @@ def to_dataframe(rows: list[ComparisonRow]) -> pd.DataFrame:
 
 # ── Formatting ────────────────────────────────────────────────────────────────
 
-def _page_label(pages: list, offset: int = 0) -> str:
-    """'(Page 33)' / '(Pages 33-34)' / '(Pages 33, 36)'."""
-    nums = sorted({int(p) + offset for p in (pages or []) if str(p).lstrip("-").isdigit()})
+_PART_SUFFIX_RE = re.compile(r"\s*\(part\s*\d+\)\s*$", re.IGNORECASE)
+
+
+def _page_numbers(pages: list, offset: int = 0) -> list[int]:
+    return sorted({int(p) + offset for p in (pages or [])
+                   if str(p).lstrip("-").isdigit()})
+
+
+def page_for(pages: list, position: float = 0.0, offset: int = 0) -> int | None:
+    """
+    The single page a passage sits on.
+
+    A chunk carries a LIST of pages (it may straddle a page break) but no
+    per-line page map, so for a multi-page chunk the page is inferred from where
+    the passage falls within it: `position` is the passage's relative offset
+    (0.0 = start of the chunk, 1.0 = end). For a single-page chunk — the common
+    case — the answer is exact.
+    """
+    nums = _page_numbers(pages, offset)
     if not nums:
-        return ""
+        return None
     if len(nums) == 1:
-        return f"(Page {nums[0]})"
-    if nums == list(range(nums[0], nums[-1] + 1)):
-        return f"(Pages {nums[0]}-{nums[-1]})"
-    return "(Pages " + ", ".join(str(n) for n in nums) + ")"
+        return nums[0]
+    idx = int(max(0.0, min(0.999, position)) * len(nums))
+    return nums[idx]
 
 
-def format_section(text: str, pages: list, page_offset: int = 0) -> str:
-    """`<passage on one line> (Page N)` — the FA Legal Section cell format."""
+def section_label(heading: str) -> str:
+    """The section name as a reviewer would cite it, without '(part N)' noise."""
+    return _PART_SUFFIX_RE.sub("", _flatten(heading)).strip()
+
+
+def format_section(text: str, heading: str, pages: list, position: float = 0.0,
+                   page_offset: int = 0) -> str:
+    """
+    One FA Legal Section entry:
+
+        <passage on one line> (<Section>, Page N)
+
+    The passage ends with the section it came from and the page it is on, so a
+    reviewer can go straight to it in the agreement.
+    """
     body = _flatten(text)
     if len(body) > MAX_QUOTE_CHARS:
         body = body[:MAX_QUOTE_CHARS].rsplit(" ", 1)[0] + "…"
-    return f"{body} {_page_label(pages, page_offset)}".strip()
+
+    page = page_for(pages, position, page_offset)
+    section = section_label(heading)
+    if section and page is not None:
+        return f"{body} ({section}, Page {page})"
+    if section:
+        return f"{body} ({section})"
+    if page is not None:
+        return f"{body} (Page {page})"
+    return body
 
 
 # ── Quote grounding: keep the sentence, drop the rest of the clause ───────────
 
-def snap_quote(quote: str, chunk_text: str) -> str | None:
+def _with_context(sents: list[str], start: int, end: int,
+                  context: int) -> tuple[str, float]:
     """
-    Locate `quote` in `chunk_text` and return the SOURCE sentence(s) containing it.
+    Widen a sentence span by `context` sentences either side and return
+    (passage, position) — position being where the span sits in the chunk
+    (0.0 start, 1.0 end), which is what locates it on a page.
+    """
+    lo = max(0, start - context)
+    hi = min(len(sents), end + context)
+    passage = " ".join(sents[lo:hi]).strip()
+    position = ((start + end) / 2.0) / max(1, len(sents))
+    return passage, position
+
+
+def snap_quote(quote: str, chunk_text: str,
+               context: int = CONTEXT_SENTENCES) -> tuple[str, float] | None:
+    """
+    Locate `quote` in `chunk_text` and return the source sentences around it.
 
     The agent is asked for verbatim wording, but models paraphrase, re-case and
     re-punctuate. Rather than trust the quote or dump the whole clause, we find
-    where it came from and return the document's own sentences — so the sheet
-    shows real FA text, trimmed to the part that was actually compared.
+    where it came from and return the document's OWN sentences — the ones
+    carrying the quote, plus `context` sentences either side so the reviewer sees
+    the proviso, the carve-out or the cross-reference that qualifies it.
 
-    Returns None when the quote is not in the passage at all (a hallucination, or
-    a quote from a different section), so the caller can drop or replace it.
+    Returns (passage, position) or None when the quote is not in the passage at
+    all (a hallucination, or a quote from a different section), so the caller can
+    drop or replace it.
     """
     needle = _norm(quote)
     if len(needle) < 8:
@@ -225,28 +286,31 @@ def snap_quote(quote: str, chunk_text: str) -> str | None:
         for j in range(i, min(i + MAX_QUOTE_SENTENCES, len(sents))):
             acc = f"{acc} {sents[j]}".strip()
             if needle in _norm(acc):
-                return acc
+                return _with_context(sents, i, j + 1, context)
 
     # The quote spans more than the cap, or merges wording: keep the sentences
     # that are themselves inside the quote.
-    hits = [s for s in sents if len(_norm(s)) >= 8 and _norm(s) in needle]
+    hits = [i for i, s in enumerate(sents)
+            if len(_norm(s)) >= 8 and _norm(s) in needle]
     if hits:
-        return " ".join(hits[:MAX_QUOTE_SENTENCES])
+        return _with_context(sents, hits[0], hits[-1] + 1, context)
     return None
 
 
-def best_sentences(chunk_text: str, target: str, max_sents: int = 2) -> str:
+def best_sentences(chunk_text: str, target: str, max_sents: int = 2,
+                   context: int = CONTEXT_SENTENCES) -> tuple[str, float]:
     """
-    Deterministic fallback: the sentences of `chunk_text` that overlap `target`
-    most. Used when the agent quoted nothing usable, so the evidence column still
-    shows the relevant sentence rather than the entire clause.
+    Deterministic fallback: the sentences of `chunk_text` overlapping `target`
+    most, widened by `context` either side. Used when the agent quoted nothing
+    usable, so the evidence column still shows the relevant part of the clause
+    rather than the entire thing.
     """
     sents = _sentences(chunk_text)
     if not sents:
-        return _flatten(chunk_text)
+        return _flatten(chunk_text), 0.0
     target_tokens = set(re.findall(r"[a-z0-9][a-z0-9.:%,/-]*", _norm(target)))
     if not target_tokens:
-        return " ".join(sents[:max_sents])
+        return _with_context(sents, 0, min(max_sents, len(sents)), context)
 
     scored = []
     for idx, sent in enumerate(sents):
@@ -256,10 +320,10 @@ def best_sentences(chunk_text: str, target: str, max_sents: int = 2) -> str:
         overlap = len(tokens & target_tokens) / len(target_tokens)
         scored.append((overlap, idx, sent))
     scored.sort(key=lambda s: (-s[0], s[1]))
-    keep = [s for s in scored[:max_sents] if s[0] > 0]
+    keep = sorted(idx for score, idx, _ in scored[:max_sents] if score > 0)
     if not keep:
-        return " ".join(sents[:max_sents])
-    return " ".join(sent for _, _, sent in sorted(keep, key=lambda s: s[1]))
+        return _with_context(sents, 0, min(max_sents, len(sents)), context)
+    return _with_context(sents, keep[0], keep[-1] + 1, context)
 
 
 # ── Evidence ──────────────────────────────────────────────────────────────────
@@ -461,25 +525,29 @@ def _build_findings(
                 snapped = snap_quote(quote, by_id[sid].content)
                 if snapped is None:
                     continue
-                key = _norm(snapped)
+                text, position = snapped
+                key = _norm(text)
                 if key not in seen:
                     seen.add(key)
-                    quotes.append(Quote(text=snapped, chunk_id=sid,
-                                        pages=by_id[sid].pages))
+                    quotes.append(Quote(text=text, chunk_id=sid,
+                                        heading=by_id[sid].heading,
+                                        pages=by_id[sid].pages, position=position))
                 if sid not in ids:
                     ids.append(sid)
                 break
 
         # A cited section that produced no usable quote still needs to show its
-        # relevant wording — but sentence-level, not the whole clause.
+        # relevant wording — but the relevant part, not the whole clause.
         if not quotes:
             for sid in ids:
-                snippet = best_sentences(by_id[sid].content, f"{aspect.text} {query}")
+                snippet, position = best_sentences(by_id[sid].content,
+                                                   f"{aspect.text} {query}")
                 key = _norm(snippet)
                 if snippet and key not in seen:
                     seen.add(key)
                     quotes.append(Quote(text=snippet, chunk_id=sid,
-                                        pages=by_id[sid].pages))
+                                        heading=by_id[sid].heading,
+                                        pages=by_id[sid].pages, position=position))
 
         findings.append(Finding(
             item_id=aspect.id, item_text=aspect.text,
@@ -592,7 +660,8 @@ def compare_one(
             if key in seen:
                 continue
             seen.add(key)
-            sections.append(format_section(quote.text, quote.pages, page_offset))
+            sections.append(format_section(quote.text, quote.heading, quote.pages,
+                                           quote.position, page_offset))
 
     if not findings:
         # Retrieval produced no items at all — nothing to compare.
