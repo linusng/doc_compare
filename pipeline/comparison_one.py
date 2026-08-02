@@ -16,13 +16,17 @@ Design notes
 Small on purpose — one LLM call, no batching, no CLI plumbing. What it does keep
 is the part that makes the row trustworthy:
 
-  • The agent is shown the ITEMS retrieval decomposed the query into, and is told
-    to address every one of them. A CP field is rarely atomic ("USD 250m,
-    quarterly repayment, Margin 2.25%"), and a free-text verdict otherwise
-    answers the easy part and drops the rest.
-  • The agent must declare which sections it USED. Only those land in the FA
-    Legal Section cell, so the column is evidence rather than a dump of
-    everything retrieval returned. Ids it invents are discarded.
+  • The agent works PER ITEM. retrieval.py has already decomposed the field into
+    its individual requirements; the agent returns a finding for each, so a
+    multi-part field ("USD 250m, quarterly repayment, Margin 2.25%") cannot have
+    its awkward parts quietly skipped. Each item's comment ends in the explicit
+    sentence "Therefore, it is (not) a deviation."
+  • The row's Deviation is Yes if ANY item deviates, No only when every item is
+    clean.
+  • The agent must QUOTE the wording it relied on, and every quote is checked
+    verbatim against the retrieved text before it reaches the sheet. Quotes are
+    snapped to the sentences they came from, so the FA Legal Section column holds
+    the operative sentence — not the whole clause — and stays reviewable.
   • Items retrieval could not cover are reported as not addressed in the FA —
     silence in the agreement is a finding, not a match.
 
@@ -34,6 +38,7 @@ coverage, marked for manual review rather than asserting "No deviation".
 
 import json
 import re
+import unicodedata
 
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -46,11 +51,18 @@ try:                                    # optional — only needed to call the m
 except ImportError:                     # pragma: no cover - depends on install
     _MESSAGES_AVAILABLE = False
 
+
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
 MIN_EVIDENCE_GRADE = 2      # retrieval grade a passage needs to reach the agent
 MAX_SECTIONS = 8            # passages shown to the agent
 SNIPPET_CHARS = 1200        # per-passage text budget in the prompt
+MAX_QUOTE_SENTENCES = 3     # a quote is snapped to at most this many sentences
+MAX_QUOTE_CHARS = 450       # hard cap on one quoted passage in the sheet
+
+# The mandated closing sentences — every assessed item ends with one of these.
+DEVIATION_SENTENCE = "Therefore, it is a deviation."
+NO_DEVIATION_SENTENCE = "Therefore, it is not a deviation."
 
 # Endpoint defaults — used only by the demo main(); compare_one takes the client.
 LLM_MODEL = "gemma3-27b-it"
@@ -58,14 +70,82 @@ BASE_URL = "http://localhost:11434/v1"
 API_KEY = "ollama"
 
 
+# ── Text normalisation (for verbatim grounding) ───────────────────────────────
+
+_PUNCT_TABLE = str.maketrans({
+    "‘": "'", "’": "'", "‚": "'", "′": "'", "`": "'", "´": "'",
+    "“": '"', "”": '"', "„": '"', "″": '"',
+    "‐": "-", "‑": "-", "–": "-", "—": "-", "−": "-",
+    " ": " ", "​": "", "­": "",
+})
+
+
+def _norm(text: str) -> str:
+    """Fold cosmetic differences only — smart quotes, dashes, spacing, case."""
+    text = unicodedata.normalize("NFKC", text or "").translate(_PUNCT_TABLE)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _flatten(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").replace("\n", " ")).strip()
+
+
+_SENTENCE_END_RE = re.compile(r"(?<=[.;:])\s+")
+
+
+def _sentences(text: str) -> list[str]:
+    """Split a passage into sentence-ish units, flattened to single lines."""
+    parts = []
+    for line in (text or "").split("\n"):
+        for sent in _SENTENCE_END_RE.split(line):
+            sent = sent.strip()
+            if sent:
+                parts.append(sent)
+    return parts
+
+
 # ── The row ───────────────────────────────────────────────────────────────────
+
+class Quote(BaseModel):
+    """A verbatim passage from the FA, tied to the section it came from."""
+    text: str
+    chunk_id: int
+    pages: list = Field(default_factory=list)
+
+
+class Finding(BaseModel):
+    """The verdict on ONE item of the CP field."""
+    item_id: int
+    item_text: str
+    deviation: bool = False
+    explanation: str = ""
+    quotes: list[Quote] = Field(default_factory=list)    # verbatim FA wording
+    chunk_ids: list[int] = Field(default_factory=list)
+    assessed: bool = True                                # False → manual review
+
+    def comment(self) -> str:
+        """`<item>: <explanation> Therefore, it is (not) a deviation.`"""
+        body = (self.explanation or "").strip()
+        # Drop any closing sentence the model wrote itself, so the mandated one
+        # is the single source of truth.
+        body = re.sub(r"\s*therefore,?\s+it\s+is\s+(?:not\s+)?a\s+deviation\.?\s*$",
+                      "", body, flags=re.IGNORECASE).strip()
+        if body and not body.endswith((".", "!", "?")):
+            body += "."
+        head = f"[{self.item_id + 1}] {self.item_text.rstrip('.')}"
+        if not self.assessed:
+            return f"{head} — {body or 'Not assessed by the comparison agent.'}"
+        tail = DEVIATION_SENTENCE if self.deviation else NO_DEVIATION_SENTENCE
+        return f"{head} — {body} {tail}".replace("  ", " ").strip()
+
 
 class ComparisonRow(BaseModel):
     """One line item of the review sheet, plus the working behind it."""
     cp_field: str
     deviation: bool = False
     comments: str = ""
-    sections: list[str] = Field(default_factory=list)   # formatted FA passages
+    sections: list[str] = Field(default_factory=list)   # formatted FA quotes
+    findings: list[Finding] = Field(default_factory=list)
     used_chunk_ids: list[int] = Field(default_factory=list)
     coverage: float = 0.0
     needs_review: bool = False
@@ -109,10 +189,77 @@ def _page_label(pages: list, offset: int = 0) -> str:
     return "(Pages " + ", ".join(str(n) for n in nums) + ")"
 
 
-def format_section(item: RetrievedItem, page_offset: int = 0) -> str:
-    """`<content on one line> (Page N)` — the FA Legal Section cell format."""
-    body = re.sub(r"\s+", " ", item.content.replace("\n", " ")).strip()
-    return f"{body or item.heading.strip()} {_page_label(item.pages, page_offset)}".strip()
+def format_section(text: str, pages: list, page_offset: int = 0) -> str:
+    """`<passage on one line> (Page N)` — the FA Legal Section cell format."""
+    body = _flatten(text)
+    if len(body) > MAX_QUOTE_CHARS:
+        body = body[:MAX_QUOTE_CHARS].rsplit(" ", 1)[0] + "…"
+    return f"{body} {_page_label(pages, page_offset)}".strip()
+
+
+# ── Quote grounding: keep the sentence, drop the rest of the clause ───────────
+
+def snap_quote(quote: str, chunk_text: str) -> str | None:
+    """
+    Locate `quote` in `chunk_text` and return the SOURCE sentence(s) containing it.
+
+    The agent is asked for verbatim wording, but models paraphrase, re-case and
+    re-punctuate. Rather than trust the quote or dump the whole clause, we find
+    where it came from and return the document's own sentences — so the sheet
+    shows real FA text, trimmed to the part that was actually compared.
+
+    Returns None when the quote is not in the passage at all (a hallucination, or
+    a quote from a different section), so the caller can drop or replace it.
+    """
+    needle = _norm(quote)
+    if len(needle) < 8:
+        return None
+
+    sents = _sentences(chunk_text)
+    if not sents:
+        return None
+
+    # A run of consecutive sentences that CONTAINS the quote.
+    for i in range(len(sents)):
+        acc = ""
+        for j in range(i, min(i + MAX_QUOTE_SENTENCES, len(sents))):
+            acc = f"{acc} {sents[j]}".strip()
+            if needle in _norm(acc):
+                return acc
+
+    # The quote spans more than the cap, or merges wording: keep the sentences
+    # that are themselves inside the quote.
+    hits = [s for s in sents if len(_norm(s)) >= 8 and _norm(s) in needle]
+    if hits:
+        return " ".join(hits[:MAX_QUOTE_SENTENCES])
+    return None
+
+
+def best_sentences(chunk_text: str, target: str, max_sents: int = 2) -> str:
+    """
+    Deterministic fallback: the sentences of `chunk_text` that overlap `target`
+    most. Used when the agent quoted nothing usable, so the evidence column still
+    shows the relevant sentence rather than the entire clause.
+    """
+    sents = _sentences(chunk_text)
+    if not sents:
+        return _flatten(chunk_text)
+    target_tokens = set(re.findall(r"[a-z0-9][a-z0-9.:%,/-]*", _norm(target)))
+    if not target_tokens:
+        return " ".join(sents[:max_sents])
+
+    scored = []
+    for idx, sent in enumerate(sents):
+        tokens = set(re.findall(r"[a-z0-9][a-z0-9.:%,/-]*", _norm(sent)))
+        if not tokens:
+            continue
+        overlap = len(tokens & target_tokens) / len(target_tokens)
+        scored.append((overlap, idx, sent))
+    scored.sort(key=lambda s: (-s[0], s[1]))
+    keep = [s for s in scored[:max_sents] if s[0] > 0]
+    if not keep:
+        return " ".join(sents[:max_sents])
+    return " ".join(sent for _, _, sent in sorted(keep, key=lambda s: s[1]))
 
 
 # ── Evidence ──────────────────────────────────────────────────────────────────
@@ -175,20 +322,41 @@ _SYSTEM = (
     "field against the signed facility agreement (FA).\n\n"
     "You are given the CP FIELD, the ITEMS it breaks down into, and FA SECTIONS "
     "retrieved for it (each with an id).\n\n"
-    "Decide whether the FA DEVIATES from the CP field. A deviation exists when the "
-    "FA states something different (different figure, period, mechanism or "
-    "condition), is more or less restrictive, or is SILENT on a required item. "
-    "Judge only from the SECTIONS text — never assume the FA contains something "
-    "you were not shown, and never treat silence as agreement.\n\n"
+    "Return ONE finding per item. For each item decide whether the FA DEVIATES "
+    "from it. A deviation exists when the FA states something different (a "
+    "different figure, period, mechanism or condition), is more or less "
+    "restrictive, or is SILENT on the item.\n\n"
+    "Rules:\n"
+    "- Judge ONLY from the SECTIONS text. Never assume the FA contains something "
+    "you were not shown, and never treat silence as agreement.\n"
+    "- Compare figures and periods EXACTLY: 2.25% vs 2.50%, quarterly vs "
+    "semi-annually, and USD vs EUR are deviations.\n"
+    "- quotes: copy the SHORTEST wording from the SECTIONS that decides the item "
+    "— the operative sentence, character-for-character. Do not paraphrase, do not "
+    "quote a whole clause, and do not quote text you were not shown.\n"
+    "- sections: the ids you actually relied on.\n"
+    "- explanation: state what the FA actually says and why it does or does not "
+    "match the item. Max 35 words. Do NOT write a concluding 'therefore' "
+    "sentence — that is added for you.\n\n"
     "Return ONLY a JSON object:\n"
-    '  {"deviation": true|false,\n'
-    '   "used_sections": [<ids of the sections you actually relied on>],\n'
-    '   "comments": "<explanation>"}\n\n'
-    "The comments must address EVERY item listed, in order: for each, state what "
-    "the FA actually says (quote the operative figure or wording) and whether it "
-    "matches, deviates, or is not addressed. Cite the clause heading. Be concrete "
-    "and concise — no preamble."
+    '  {"findings": [\n'
+    '     {"item": <id>, "deviation": true|false, "sections": [<id>, ...],\n'
+    '      "quotes": ["<verbatim FA wording>", ...],\n'
+    '      "explanation": "<what the FA says and how it compares>"}\n'
+    "  ]}"
 )
+
+
+def _parse_json_object(raw: str) -> dict:
+    """Pull the JSON object out of the model's reply, tolerantly."""
+    m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _chat(llm, system: str, human: str, verbose: bool = True) -> str:
@@ -212,16 +380,148 @@ def _chat(llm, system: str, human: str, verbose: bool = True) -> str:
         return ""
 
 
-def _parse_json_object(raw: str) -> dict:
-    """Pull the JSON object out of the model's reply, tolerantly."""
-    m = re.search(r"\{.*\}", raw or "", re.DOTALL)
-    if not m:
-        return {}
-    try:
-        data = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
+# ── Finding assembly ──────────────────────────────────────────────────────────
+
+def _build_findings(
+    data: dict,
+    res: RetrievalResult,
+    by_id: dict[int, RetrievedItem],
+    query: str,
+    treat_missing_as_deviation: bool,
+) -> list[Finding]:
+    """
+    Turn the agent's reply into exactly one finding per item.
+
+    Guarantees enforced here, because the model gets each of them wrong often
+    enough to matter:
+      • every item gets a finding — skipped ones fall back to retrieval coverage;
+      • only real section ids survive;
+      • only quotes that ground verbatim in a cited section survive, snapped to
+        the source sentence. A cited section with no usable quote falls back to
+        its most relevant sentences rather than the whole clause.
+    """
+    raw = data.get("findings")
+    by_item: dict[int, dict] = {}
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                by_item.setdefault(int(entry.get("item")), entry)
+            except (TypeError, ValueError):
+                continue
+
+    aspects = res.aspects or []
+    findings: list[Finding] = []
+
+    for aspect in aspects:
+        entry = by_item.get(aspect.id)
+
+        if entry is None:
+            # Retrieval found nothing → the FA is silent, which is a finding we
+            # can make without the model. Otherwise it is simply unassessed.
+            if not aspect.covered:
+                findings.append(Finding(
+                    item_id=aspect.id, item_text=aspect.text,
+                    deviation=bool(treat_missing_as_deviation),
+                    explanation="No provision addressing this item was found in the FA.",
+                    assessed=True,
+                ))
+            else:
+                findings.append(Finding(
+                    item_id=aspect.id, item_text=aspect.text, deviation=False,
+                    explanation=("Passages were retrieved for this item but the "
+                                 "comparison agent returned no finding — manual "
+                                 "review required."),
+                    assessed=False,
+                    chunk_ids=[c for c in aspect.evidence if c in by_id][:2],
+                ))
+            continue
+
+        ids: list[int] = []
+        for sid in entry.get("sections") or []:
+            try:
+                sid = int(sid)
+            except (TypeError, ValueError):
+                continue
+            if sid in by_id and sid not in ids:
+                ids.append(sid)
+
+        # Ground each quote against the sections the agent cited (and, failing
+        # that, any retrieved section — models mislabel the id more often than
+        # they invent the text).
+        quotes: list[Quote] = []
+        seen: set[str] = set()
+        for quote in entry.get("quotes") or []:
+            quote = str(quote or "").strip()
+            if not quote:
+                continue
+            search_ids = ids or list(by_id)
+            for sid in list(search_ids) + [i for i in by_id if i not in search_ids]:
+                snapped = snap_quote(quote, by_id[sid].content)
+                if snapped is None:
+                    continue
+                key = _norm(snapped)
+                if key not in seen:
+                    seen.add(key)
+                    quotes.append(Quote(text=snapped, chunk_id=sid,
+                                        pages=by_id[sid].pages))
+                if sid not in ids:
+                    ids.append(sid)
+                break
+
+        # A cited section that produced no usable quote still needs to show its
+        # relevant wording — but sentence-level, not the whole clause.
+        if not quotes:
+            for sid in ids:
+                snippet = best_sentences(by_id[sid].content, f"{aspect.text} {query}")
+                key = _norm(snippet)
+                if snippet and key not in seen:
+                    seen.add(key)
+                    quotes.append(Quote(text=snippet, chunk_id=sid,
+                                        pages=by_id[sid].pages))
+
+        findings.append(Finding(
+            item_id=aspect.id, item_text=aspect.text,
+            deviation=bool(entry.get("deviation", False)),
+            explanation=str(entry.get("explanation", "") or "").strip(),
+            quotes=quotes, chunk_ids=ids, assessed=True,
+        ))
+
+    return findings
+
+
+def _compose_comments(findings: list[Finding], needs_review: bool) -> str:
+    """
+    One line per item, IN ITEM ORDER, each ending in the mandated sentence.
+
+    Assembling this deterministically (rather than asking the model for a
+    paragraph) is what guarantees the whole field is addressed: a model writing
+    prose drops the uninteresting items. Item order is kept so the cell reads
+    against the CP field itself; the header line carries the deviation count so
+    nothing important depends on reading to the end.
+    """
+    if not findings:
+        return ""
+
+    deviating = [f for f in findings if f.assessed and f.deviation]
+    clean = [f for f in findings if f.assessed and not f.deviation]
+    unassessed = [f for f in findings if not f.assessed]
+
+    head = []
+    if deviating:
+        head.append(f"{len(deviating)} deviation(s)")
+    if clean:
+        head.append(f"{len(clean)} no deviation")
+    if unassessed:
+        head.append(f"{len(unassessed)} not assessed")
+    lines = [f"{len(findings)} item(s) checked: " + ", ".join(head) + "."]
+
+    lines.extend(f.comment() for f in sorted(findings, key=lambda f: f.item_id))
+
+    if needs_review:
+        lines.append("⚠ Manual review required — see the items marked not assessed.")
+    return "\n".join(lines)
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -233,6 +533,7 @@ def compare_one(
     min_evidence_grade: int = MIN_EVIDENCE_GRADE,
     max_sections: int = MAX_SECTIONS,
     page_offset: int = 0,
+    treat_missing_as_deviation: bool = True,
     verbose: bool = True,
 ) -> ComparisonRow:
     """
@@ -247,9 +548,13 @@ def compare_one(
         min_evidence_grade: retrieval grade a passage needs to reach the agent.
         page_offset: added to page numbers in the FA Legal Section cell (use the
                      index's page_offset to show printed page numbers).
+        treat_missing_as_deviation: an item no FA passage addresses counts as a
+                     deviation (default True — FA silence is a review finding).
 
     Returns:
-        ComparisonRow — .deviation, .comments, .fa_legal_section, .to_dict().
+        ComparisonRow. `.deviation` is True if ANY item deviates; `.comments`
+        carries one line per item, each ending "Therefore, it is (not) a
+        deviation."; `.fa_legal_section` holds the quoted FA sentences with pages.
     """
     evidence = select_evidence(res, min_evidence_grade, max_sections)
     by_id = {it.chunk_id: it for it in evidence}
@@ -258,11 +563,9 @@ def compare_one(
                    or f"  [0] {query}")
     missing = [a.text for a in res.uncovered_aspects]
 
-    missing_label = "; ".join(m[:80].rstrip(". ") for m in missing)
-
     human = (
         f"CP FIELD:\n{query}\n\n"
-        f"ITEMS (address every one in your comments):\n{items_block}\n\n"
+        f"ITEMS (return one finding for EACH):\n{items_block}\n\n"
         + (f"ITEMS FOR WHICH RETRIEVAL FOUND NOTHING (treat as not addressed "
            f"unless a section below covers them):\n"
            + "\n".join(f"  - {m}" for m in missing) + "\n\n" if missing else "")
@@ -270,46 +573,44 @@ def compare_one(
     )
     data = _parse_json_object(_chat(llm, _SYSTEM, human, verbose))
 
-    # ── The agent's citations decide the evidence column ─────────────────────
+    findings = _build_findings(data, res, by_id, query, treat_missing_as_deviation)
+    needs_review = any(not f.assessed for f in findings) or not findings
+
+    # ── The row's verdict: Yes if ANY item deviates, No only if none do ──────
+    deviation = any(f.deviation for f in findings if f.assessed)
+
+    # ── FA Legal Section: the quoted sentences, in item order, deduped ───────
+    sections: list[str] = []
     used_ids: list[int] = []
-    for sid in data.get("used_sections") or []:
-        try:
-            sid = int(sid)
-        except (TypeError, ValueError):
-            continue
-        if sid in by_id and sid not in used_ids:
-            used_ids.append(sid)
+    seen: set[str] = set()
+    for f in findings:
+        for cid in f.chunk_ids:
+            if cid not in used_ids:
+                used_ids.append(cid)
+        for quote in f.quotes:
+            key = _norm(quote.text)
+            if key in seen:
+                continue
+            seen.add(key)
+            sections.append(format_section(quote.text, quote.pages, page_offset))
 
-    needs_review = not data
-    comments = str(data.get("comments", "") or "").strip()
-    deviation = bool(data.get("deviation", False))
-
-    if needs_review:
-        # No usable verdict — report the evidence and say so, rather than
-        # recording a "No deviation" nobody stands behind.
-        used_ids = [it.chunk_id for it in evidence if not it.is_support][:max_sections]
-        comments = ("[Comparison agent unavailable — manual review required] "
-                    f"Retrieval covered {res.coverage:.0%} of the field's items; "
-                    f"{len(used_ids)} passage(s) retrieved.")
-        if missing:
-            comments += f" Not found in FA: {missing_label}."
-    elif missing and not deviation:
-        # The agent said no deviation while retrieval covered nothing for an
-        # item — surface that rather than letting it pass silently.
-        comments += f"\n⚠ No FA passage was found for: {missing_label}."
+    if not findings:
+        # Retrieval produced no items at all — nothing to compare.
+        comments = ("[No items could be derived from this field — manual review "
+                    "required]")
+    else:
+        comments = _compose_comments(findings, needs_review)
 
     row = ComparisonRow(
-        cp_field=query,
-        deviation=deviation,
-        comments=comments,
-        sections=[format_section(by_id[cid], page_offset) for cid in used_ids],
-        used_chunk_ids=used_ids,
-        coverage=res.coverage,
+        cp_field=query, deviation=deviation, comments=comments, sections=sections,
+        findings=findings, used_chunk_ids=used_ids, coverage=res.coverage,
         needs_review=needs_review,
     )
     if verbose:
+        n_dev = sum(1 for f in findings if f.assessed and f.deviation)
         print(f"      → Deviation: {row.deviation_label} · "
-              f"{len(row.sections)} section(s) cited · coverage {res.coverage:.0%}")
+              f"{n_dev}/{len(findings)} item(s) deviate · "
+              f"{len(sections)} passage(s) quoted · coverage {res.coverage:.0%}")
     return row
 
 
