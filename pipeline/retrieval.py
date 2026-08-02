@@ -32,7 +32,11 @@ it. Each stage exists to fix a specific failure of naive top-k RAG:
                  item each (a deterministic segmenter, refined by an LLM when
                  one is available). Every aspect gets its own retrieval budget,
                  so a short clause mentioned once in a long paragraph is never
-                 drowned out by the paragraph's bulk.
+                 drowned out by the paragraph's bulk. Items that lean on earlier
+                 ones ("the Company shall provide the above within 30 days") are
+                 RESOLVED against them before anything is searched — a fragment
+                 naming no subject retrieves nothing and would be reported as
+                 uncovered when the document addresses it perfectly well.
   2. PLAN        Per aspect: the aspect text, its key terms (quoted terms,
                  capitalised defined terms, acronyms, amounts, ratios), explicit
                  cross-references, a defined-term probe ('"Margin" means'), and
@@ -564,9 +568,12 @@ _CAP_PHRASE_RE = re.compile(
     r"\b((?:[A-Z][a-z][A-Za-z0-9\-']*|[A-Z]{2,})"
     r"(?:[ \t]+(?:[A-Z][a-z][A-Za-z0-9\-']*|[A-Z]{2,}))*)\b"
 )
-# Numbers that matter in a covenant: amounts, percentages, ratios, dates.
+# Numbers that matter in a covenant: amounts, percentages, ratios.
+# The currency code is matched CASE-SENSITIVELY — (?-i:[A-Z]{3}) inside an
+# otherwise case-insensitive pattern. Without that, "within 30 days" yields the
+# amount "hin 30", which then becomes a search query and a numeric signal.
 _VALUE_RE = re.compile(
-    r"(?:[A-Z]{3}\s?[\d,]+(?:\.\d+)?(?:\s?(?:million|billion|m|bn))?"
+    r"(?:\b(?-i:[A-Z]{3})\s?[\d,]+(?:\.\d+)?(?:\s?(?:million|billion|m|bn))?"
     r"|[£$€]\s?[\d,]+(?:\.\d+)?(?:\s?(?:million|billion|m|bn))?"
     r"|\d+(?:\.\d+)?\s?(?:per\s?cent\.?|percent|%)"
     r"|\d+(?:\.\d+)?\s?:\s?\d+(?:\.\d+)?"
@@ -648,6 +655,11 @@ class Aspect(BaseModel):
     The unit of coverage: retrieval succeeds when every aspect has at least one
     chunk graded >= min_grade. `queries` is the full trail of search strings
     tried for this aspect, including the agent's refinements.
+
+    `text` is the item as written. `search_text` is the form actually searched
+    and graded against: identical for a self-contained item, but for one that
+    leans on earlier items ("the Company shall provide the above within 30 days")
+    it carries the resolved subject matter — see _resolve_back_references.
     """
     id: int
     text: str
@@ -659,6 +671,13 @@ class Aspect(BaseModel):
     covered: bool = False
     best_grade: int = 0
     evidence: list[int] = Field(default_factory=list)   # chunk_ids, best-first
+    refers_back: bool = False     # leans on the items before it
+    search_text: str = ""         # resolved form; falls back to `text`
+
+    @property
+    def query_text(self) -> str:
+        """What retrieval should actually search for."""
+        return self.search_text or self.text
 
     @property
     def label(self) -> str:
@@ -866,6 +885,84 @@ _BULLET_RE = re.compile(r"^\s*(?:[-•*–]|\(?[a-z0-9]{1,3}[.)])\s+", re.IGNORE
 MIN_ASPECT_CHARS = 20       # below this a segment is a fragment, not an item
 MIN_ASPECT_TOKENS = 3       # …as is anything with fewer content words than this
 MAX_ASPECT_CHARS = 400
+MAX_BACKREF_CONTEXT = 2     # preceding items folded into a back-reference
+MAX_SEARCH_TEXT_CHARS = 600 # cap on a resolved query, so it stays focused
+
+
+# ── Back-references between items ─────────────────────────────────────────────
+#
+# Decomposition buys per-item coverage, but items are fragments of one text and
+# some of them only mean something in the context of the ones before:
+#
+#     "The Company shall provide certified copies of its constitutional
+#      documents. A certificate of incumbency is also required. The Company
+#      shall provide the above within 30 days of signing."
+#
+# Searched on its own, "the Company shall provide the above within 30 days"
+# names no subject and matches nothing useful — the item is reported uncovered
+# while the clause that decides it (the delivery deadline) is never retrieved.
+# So we detect these and search the RESOLVED form instead.
+
+_BACKREF_RE = re.compile(
+    r"\b("
+    r"the above|above[-\s]mentioned|abovementioned|aforementioned|aforesaid"
+    r"|the foregoing|as (?:stated|set out|described|mentioned|listed) above"
+    r"|the preceding|the said|said (?:documents?|items?|conditions?)"
+    r"|such (?:documents?|items?|information|conditions?|requirements?|"
+    r"deliverables?|matters?|amounts?|obligations?)"
+    r"|there(?:of|in|to|under|with)"
+    r"|the same"
+    r")\b",
+    re.IGNORECASE,
+)
+_LEADING_PRONOUN_RE = re.compile(
+    r"^\s*(?:it|they|these|those|this|that|he|she|such)\b\s+"
+    r"(?:shall|must|will|is|are|was|were)",
+    re.IGNORECASE,
+)
+
+
+def has_back_reference(text: str) -> bool:
+    """
+    True if the item leans on wording that came before it in the input.
+
+    Detects the anaphora that makes an item unsearchable on its own: "the
+    above", "such documents", "the foregoing", "thereof", or an opening bare
+    pronoun ("These shall be certified").
+    """
+    t = text or ""
+    return bool(_BACKREF_RE.search(t) or _LEADING_PRONOUN_RE.match(t))
+
+
+def _resolve_back_references(aspects: list[Aspect]) -> None:
+    """
+    Give every back-referencing item a self-contained `search_text`, in place.
+
+    The referent is the item(s) immediately before it — that is what "the above"
+    means in a list of requirements. Their text is folded in ahead of the item's
+    own, and their key terms are inherited, so the focused per-term searches fire
+    for this item too. `text` is left untouched: the item is still reported and
+    compared as the author wrote it.
+    """
+    for i, aspect in enumerate(aspects):
+        if not has_back_reference(aspect.text):
+            continue
+        aspect.refers_back = True
+
+        prior = aspects[max(0, i - MAX_BACKREF_CONTEXT):i]
+        if not prior:
+            continue    # nothing to resolve against — a lead item that just reads that way
+
+        resolved = " ".join([p.text for p in prior] + [aspect.text])
+        aspect.search_text = resolved[:MAX_SEARCH_TEXT_CHARS]
+
+        seen = {_normalize(t) for t in aspect.key_terms}
+        for p in prior:
+            for term in p.key_terms:
+                key = _normalize(term)
+                if key not in seen and len(aspect.key_terms) < 6:
+                    seen.add(key)
+                    aspect.key_terms.append(term)
 
 
 def heuristic_aspects(text: str, max_aspects: int = MAX_ASPECTS) -> list[str]:
@@ -952,7 +1049,11 @@ _DECOMPOSE_SYSTEM = (
     "- One item = one self-contained fact, obligation, definition, amount or "
     "requirement. If a sentence mentions two obligations, split it.\n"
     "- Keep the item's own wording; do NOT summarise into abstract labels.\n"
-    "- Resolve pronouns so each item stands alone (\"it\" → the thing meant).\n"
+    "- Every item must STAND ALONE, because each is searched on its own. Resolve "
+    "pronouns and back-references against the earlier text: \"it\" → the thing "
+    "meant; \"the Company shall provide the above within 30 days\" → \"the Company "
+    "shall provide the constitutional documents and certificate of incumbency "
+    "within 30 days\"; \"such documents\" → which documents.\n"
     "- Do not invent items that are not in the text; do not merge distinct ones.\n\n"
     "Return ONLY a JSON array. Each element:\n"
     '  {"item": "<the self-contained item text>", '
@@ -1066,9 +1167,17 @@ def build_aspects(
             kind="section_ref", section_refs=[ref],
         ))
 
+    # Items that lean on earlier ones get a resolved query before anything is
+    # searched — otherwise they retrieve nothing and are reported as uncovered.
+    _resolve_back_references(aspects)
+
     if verbose:
         print(f"      → {len(aspects)} item(s) decomposed ({source}); "
               f"e.g. {[a.label[:48] for a in aspects[:3]]}")
+        resolved = [a.id for a in aspects if a.refers_back]
+        if resolved:
+            print(f"      → item(s) {resolved} refer back; searching their "
+                  f"resolved form")
     return aspects
 
 
@@ -1104,7 +1213,7 @@ def plan_queries(aspect: Aspect, llm: LLM, use_hyde: bool = True) -> list[str]:
             return
         queries.append(q)
 
-    _add(aspect.text[:400])
+    _add(aspect.query_text[:400])
     for t in aspect.key_terms:
         _add(t)
         if t[:1].isupper():
@@ -1115,7 +1224,7 @@ def plan_queries(aspect: Aspect, llm: LLM, use_hyde: bool = True) -> list[str]:
         _add(v)
 
     if use_hyde and llm.available and aspect.kind == "clause":
-        hyde = llm.chat(_HYDE_SYSTEM, aspect.text[:1200]).strip()
+        hyde = llm.chat(_HYDE_SYSTEM, aspect.query_text[:1200]).strip()
         if len(hyde) > 40:
             _add(hyde[:1200])
 
@@ -1147,7 +1256,7 @@ def refine_queries(aspect: Aspect, seen_headings: list[str], llm: LLM,
     """
     if llm.available:
         human = (
-            f"ITEM:\n{aspect.text[:800]}\n\n"
+            f"ITEM:\n{aspect.query_text[:800]}\n\n"
             f"QUERIES ALREADY TRIED:\n" + "\n".join(f"- {q[:120]}" for q in aspect.queries[:8])
             + "\n\nHEADINGS RETURNED (none contained the item):\n"
             + ("\n".join(f"- {h[:100]}" for h in seen_headings[:8]) or "- (nothing)")
@@ -1168,7 +1277,7 @@ def refine_queries(aspect: Aspect, seen_headings: list[str], llm: LLM,
             if not any(_normalize(cand) == _normalize(q) for q in aspect.queries):
                 fallback.append(cand)
     # Content words alone, stripped of the item's connective bulk.
-    core = " ".join(_tokenize(aspect.text)[:8])
+    core = " ".join(_tokenize(aspect.query_text)[:8])
     if core and not any(_normalize(core) == _normalize(q) for q in aspect.queries):
         fallback.append(core)
     return fallback[:max_new]
@@ -1413,7 +1522,7 @@ def _lexical_grade(aspect: Aspect, chunk: _ChunkView) -> int:
     about the same term; grading that passage away would report the clause as
     missing instead of as a deviation.
     """
-    a_tokens = set(_tokenize(aspect.text))
+    a_tokens = set(_tokenize(aspect.query_text))
     if not a_tokens:
         return 0
     overlap = len(a_tokens & chunk.token_set) / len(a_tokens)
@@ -1460,7 +1569,7 @@ def rerank_candidates(
                 continue
             body = ch.content.strip()[:snippet_chars] or ch.heading
             lines.append(f"### CANDIDATE {cid}\nHEADING: {ch.heading}\nTEXT: {body}")
-        human = f"ITEM:\n{aspect.text[:900]}\n\n" + "\n\n".join(lines)
+        human = f"ITEM:\n{aspect.query_text[:900]}\n\n" + "\n\n".join(lines)
         for entry in parse_json_array(llm.chat(_RERANK_SYSTEM, human)):
             if not isinstance(entry, dict):
                 continue
@@ -1625,6 +1734,24 @@ def select_items(
                 if grade >= 1 and len(order) < max_items:
                     _place(a, cid, grade, score, why)
                     break
+
+    # Pass 4: spend any LEFTOVER budget on weak evidence, best-first.
+    #
+    # A grade is assigned per item, and the clause that settles an item is not
+    # always the one that scores highest against it — an item about a deadline
+    # ("…provide the above within 30 days") grades the delivery clause low
+    # because they share little vocabulary. Dropping it entirely leaves nothing
+    # downstream can cite. `max_items` is a cap, not a target: if slots remain,
+    # weak passages are better in the set than absent, and they sort last.
+    if len(order) < max_items:
+        leftovers = sorted(
+            ((a, row) for a in aspects for row in queues[a.id] if row[1] >= 1),
+            key=lambda pair: (-pair[1][1], -pair[1][2]),
+        )
+        for aspect, (cid, grade, score, why) in leftovers:
+            if len(order) >= max_items:
+                break
+            _place(aspect, cid, grade, score, why)
 
     items = [chosen[cid] for cid in order]
     items.sort(key=lambda it: (-it.grade, -it.score))
