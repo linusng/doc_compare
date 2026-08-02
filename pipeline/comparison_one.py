@@ -1,9 +1,10 @@
 """
 Single-field deviation check — the minimal Comparison Agent.
 
-    index = DocumentIndexV2.from_pdf("fa.pdf")
+    llm   = ChatOpenAI(model=..., base_url=..., api_key=..., temperature=0)
+    index = DocumentIndexV3.from_pdf("fa.pdf")
     res   = Retriever(index).retrieve(query)      # pipeline.retrieval
-    row   = compare_one(query, res)               # this module
+    row   = compare_one(query, res, llm)          # this module
 
 `compare_one` takes the CP field (the query) and the RetrievalResult it produced,
 and returns ONE row of the review sheet:
@@ -25,8 +26,10 @@ is the part that makes the row trustworthy:
   • Items retrieval could not cover are reported as not addressed in the FA —
     silence in the agreement is a finding, not a match.
 
-With no LLM reachable the row still carries its evidence and coverage, marked
-for manual review rather than asserting "No deviation".
+The chat model is INJECTED (`llm`), not constructed here, so the caller owns the
+endpoint, model and temperature — and the same client can be reused across
+fields. If it is None, or the call fails, the row still carries its evidence and
+coverage, marked for manual review rather than asserting "No deviation".
 """
 
 import json
@@ -35,13 +38,24 @@ import re
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from .retrieval import LLM, RetrievalResult, RetrievedItem, Retriever
+from .retrieval import RetrievalResult, RetrievedItem, Retriever
+
+try:                                    # optional — only needed to call the model
+    from langchain_core.messages import HumanMessage, SystemMessage
+    _MESSAGES_AVAILABLE = True
+except ImportError:                     # pragma: no cover - depends on install
+    _MESSAGES_AVAILABLE = False
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
 MIN_EVIDENCE_GRADE = 2      # retrieval grade a passage needs to reach the agent
 MAX_SECTIONS = 8            # passages shown to the agent
 SNIPPET_CHARS = 1200        # per-passage text budget in the prompt
+
+# Endpoint defaults — used only by the demo main(); compare_one takes the client.
+LLM_MODEL = "gemma3-27b-it"
+BASE_URL = "http://localhost:11434/v1"
+API_KEY = "ollama"
 
 
 # ── The row ───────────────────────────────────────────────────────────────────
@@ -177,6 +191,27 @@ _SYSTEM = (
 )
 
 
+def _chat(llm, system: str, human: str, verbose: bool = True) -> str:
+    """
+    Invoke the injected chat model and return its text.
+
+    Returns "" when there is no model or the call fails — the caller then takes
+    the manual-review path instead of the whole row erroring out.
+    """
+    if llm is None:
+        return ""
+    try:
+        messages = ([SystemMessage(content=system), HumanMessage(content=human)]
+                    if _MESSAGES_AVAILABLE
+                    else [("system", system), ("human", human)])
+        out = llm.invoke(messages).content
+        return out if isinstance(out, str) else str(out or "")
+    except Exception as exc:                        # noqa: BLE001 — endpoint down, etc.
+        if verbose:
+            print(f"      → LLM call failed ({type(exc).__name__}: {exc})")
+        return ""
+
+
 def _parse_json_object(raw: str) -> dict:
     """Pull the JSON object out of the model's reply, tolerantly."""
     m = re.search(r"\{.*\}", raw or "", re.DOTALL)
@@ -194,10 +229,7 @@ def _parse_json_object(raw: str) -> dict:
 def compare_one(
     query: str,
     res: RetrievalResult,
-    llm_model: str = "gemma3-27b-it",
-    base_url: str = "http://localhost:11434/v1",
-    api_key: str = "ollama",
-    use_llm: bool = True,
+    llm=None,
     min_evidence_grade: int = MIN_EVIDENCE_GRADE,
     max_sections: int = MAX_SECTIONS,
     page_offset: int = 0,
@@ -209,6 +241,9 @@ def compare_one(
     Args:
         query: the CP field — free text, may cover several requirements.
         res:   the RetrievalResult for that query (Retriever(index).retrieve(query)).
+        llm:   a ChatOpenAI (or any chat model with .invoke(messages) -> .content).
+               None runs the deterministic path: evidence and coverage only, the
+               row marked for manual review.
         min_evidence_grade: retrieval grade a passage needs to reach the agent.
         page_offset: added to page numbers in the FA Legal Section cell (use the
                      index's page_offset to show printed page numbers).
@@ -225,8 +260,6 @@ def compare_one(
 
     missing_label = "; ".join(m[:80].rstrip(". ") for m in missing)
 
-    llm = LLM(model=llm_model, base_url=base_url, api_key=api_key,
-              enabled=use_llm, verbose=verbose)
     human = (
         f"CP FIELD:\n{query}\n\n"
         f"ITEMS (address every one in your comments):\n{items_block}\n\n"
@@ -235,7 +268,7 @@ def compare_one(
            + "\n".join(f"  - {m}" for m in missing) + "\n\n" if missing else "")
         + f"FA SECTIONS:\n{_evidence_block(evidence)}"
     )
-    data = _parse_json_object(llm.chat(_SYSTEM, human))
+    data = _parse_json_object(_chat(llm, _SYSTEM, human, verbose))
 
     # ── The agent's citations decide the evidence column ─────────────────────
     used_ids: list[int] = []
@@ -291,11 +324,18 @@ def main() -> None:
 
     pdf_path, query = sys.argv[1], sys.argv[2]
 
-    from .ingestion_v2 import DocumentIndexV2
+    from langchain_openai import ChatOpenAI
 
-    index = DocumentIndexV2.from_pdf(pdf_path)
-    res = Retriever(index).retrieve(query)
-    row = compare_one(query, res)
+    from .ingestion_v3 import DocumentIndexV3
+
+    llm = ChatOpenAI(model=LLM_MODEL, base_url=BASE_URL, api_key=API_KEY,
+                     temperature=0)
+
+    index = DocumentIndexV3.from_pdf(pdf_path, llm_model=LLM_MODEL,
+                                     base_url=BASE_URL, api_key=API_KEY)
+    res = Retriever(index, llm_model=LLM_MODEL, base_url=BASE_URL,
+                    api_key=API_KEY).retrieve(query)
+    row = compare_one(query, res, llm, page_offset=index.page_offset)
 
     print("\n" + "=" * 70)
     print(res.coverage_report())
